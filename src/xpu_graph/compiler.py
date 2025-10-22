@@ -1,3 +1,4 @@
+import functools
 import os
 from itertools import chain
 from typing import Callable
@@ -18,6 +19,7 @@ from .fx_utils import (
     fakify_tensors,
     find_hop_nodes,
     find_subclass_inputs,
+    freeze_compile,
 )
 from .passes.pass_manager import PassManager
 from .passes.patterns.plugin_pattern import __PLUGIN_PATTERN_GROUP__
@@ -57,7 +59,7 @@ class XpuGraph:
             fake_mode, fake_inputs = fakify_tensors(fake_inputs)
 
             with fake_mode:
-                if self._config.enable_cache:
+                if self._config.enable_cache and stage != FxStage.joint:
                     hashkey = self._cache.cache_key(gm, fake_inputs, self._config, stage)
                     cached_compiled = self._cache.load_artifact(hashkey)
                     if cached_compiled is not None:
@@ -104,7 +106,7 @@ class XpuGraph:
                 else:
                     xpu_compiled = SerializableGraphModule(xpu_compiled)
 
-                if self._config.enable_cache:
+                if self._config.enable_cache and stage != FxStage.joint:
                     if isinstance(xpu_compiled, SerializableArtifact):
                         xpu_compiled = self._cache.save_artifact(hashkey, xpu_compiled)
                     else:
@@ -194,20 +196,45 @@ class XpuGraph:
 
         return xpu_gm, fw_metadata
 
+    def _dispatch_and_compile(self, dynamo_gm, example_inputs, *args, **kwargs):
+        aot_config = {}
+        aot_config["keep_inference_input_mutations"] = True
+        aot_config["fw_compiler"] = self._get_compiler(FxStage.forward)
+        aot_config["bw_compiler"] = self._get_compiler(FxStage.backward)
+
+        def partition_fn(joint_gm, joint_args, *, num_fwd_outputs):
+            new_joint_gm = self._get_compiler(FxStage.joint)(joint_gm, joint_args)
+
+            from torch._functorch.partitioners import default_partition
+
+            partition_fn = get_partition_fn(self._config.partition_fn) or default_partition
+
+            return partition_fn(new_joint_gm, joint_args, num_fwd_outputs=num_fwd_outputs)
+
+        aot_config["partition_fn"] = partition_fn
+        if self._config.freeze:
+            aot_config["inference_compiler"] = functools.partial(
+                freeze_compile, dynamo_gm, inner_compiler=self._get_compiler(FxStage.inference)
+            )
+        else:
+            aot_config["inference_compiler"] = self._get_compiler(FxStage.inference)
+
+        compiled = aot_autograd(**aot_config)(dynamo_gm, example_inputs)
+
+        if tracing_context := torch._guards.TracingContext.try_get():
+            fw_metadata = tracing_context.fw_metadata
+        else:
+            fw_metadata = None
+
+        return compiled, fw_metadata
+
     def __call__(self, dynamo_gm, example_inputs, *args, **kwargs):
         logger.info(f"{self._config}")
 
         if self._config.fallback_legacy_dispatch:
             xpu_gm, fw_metadata = self._legacy_dispatch_and_compile(dynamo_gm, example_inputs)
         else:
-            # Temporially use aot_eager as a placeholder
-            from torch._dynamo.backends.debugging import aot_eager
-
-            xpu_gm = aot_eager(dynamo_gm, example_inputs)
-            if tracing_context := torch._guards.TracingContext.try_get():
-                fw_metadata = tracing_context.fw_metadata
-            else:
-                fw_metadata = None
+            xpu_gm, fw_metadata = self._dispatch_and_compile(dynamo_gm, example_inputs)
 
         xpu_gm = XpuGraphRuntimeArtifact(xpu_gm)
 
@@ -243,7 +270,7 @@ class XpuGraph:
     def _set_context(self):
         self._orig_ctx = {}
         self._orig_ctx["torch._inductor.config.freezing"] = torch._inductor.config.freezing
-        if self._config.freeze and self._config.is_training == False:
+        if self._config.freeze and self._config.is_training is False:
             # The configuration in this inductor affects the return value of is_parameter_freezing(),
             # thereby influencing the process of generating the fx_graph in dynamo. The current code
             # in the community is not very clean, and it would be more reasonable to place this
@@ -314,8 +341,7 @@ class XpuGraphCompiler:
 
         return chained_setter
 
-    def prior_work(self):
-        ...
+    def prior_work(self): ...
 
     def done(self):
         self._compiler = XpuGraph(self._config)
