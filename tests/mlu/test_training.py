@@ -1,10 +1,11 @@
+
 import pytest
 import torch
-
 import xpu_graph
-from tests.common.test_models import all_models, compare_training
 from xpu_graph import OptLevel
-from xpu_graph.test_utils import is_similar, need_xpu_graph_logs
+from xpu_graph.test_utils import need_xpu_graph_logs
+
+from tests.common.test_models import all_models, compare_training
 
 device = "mlu"
 data_type = torch.float32

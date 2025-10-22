@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 import xpu_graph
 from xpu_graph.test_utils import is_similar, need_xpu_graph_logs
 
