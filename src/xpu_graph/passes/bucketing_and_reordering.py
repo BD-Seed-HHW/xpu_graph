@@ -303,7 +303,7 @@ class BucketingAndReordering(Optimizer):
 
     def _manual_reorder_graph(self) -> None:
         """
-
+        Reorder the graph manually based on the bucketed collectives.
         """
         delayed_rs_nodes: list[fx.Node] = []
         overlap_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
