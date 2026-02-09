@@ -28,18 +28,8 @@ from .bucketing import (
 
 @dataclass
 class CollectiveInfo:
-    """Track info about a collective operation"""
-
     start_node: fx.Node
     wait_node: fx.Node
-    size_bytes: int
-    estimated_time_ms: float
-    exposed_time_ms: float  # How much of this collective is still exposed
-    hiding_nodes: OrderedSet[fx.Node] = field(default_factory=OrderedSet)
-
-    @property
-    def is_exposed(self) -> bool:
-        return self.exposed_time_ms != 0
 
 
 class COLL(IntEnum):
@@ -51,12 +41,6 @@ class COLL(IntEnum):
 
 
 def _schedulable_wait_node(node: torch.fx.Node) -> bool:
-    """
-    Add additional check on if the wait node is schedulable
-    We should not schedule a fx node that is:
-        1. wait on a collective that is not callable
-        2. wait on a non-NCCL communication node
-    """
     if not is_wait_tensor(node):
         return False
     assert isinstance(node.args[0], torch.fx.Node)
@@ -194,10 +178,6 @@ class ManualBucketer:
     ) -> bool:
         """
         Check if the node is directly used for fetch parameters/gradients
-
-        TODO (ruisizhang123): currently, we assume the node only pre-fetch/update one parameter/gradient
-            We should handle multiple parameters/gradients update case by checking if there are non closure
-            computes along the path from primal/output to coll_node
         """
         deps: OrderedSet[fx.Node] = dep_dict[node]
         seen_target_op = 0
@@ -316,9 +296,6 @@ class BucketingAndReordering(Optimizer):
                 info = CollectiveInfo(
                     start_node=start,
                     wait_node=node,
-                    size_bytes=0,
-                    estimated_time_ms=0,
-                    exposed_time_ms=0,
                 )
                 self.collective_info[start] = info
 
