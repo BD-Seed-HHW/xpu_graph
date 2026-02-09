@@ -7,7 +7,7 @@ from torch import fx
 import torch.distributed as dist
 
 
-# copied from torch
+# adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/bucketing.py
 
 BucketMode: TypeAlias = Literal["default", "custom_ops", "custom_ops_multidtype"]
 
@@ -145,7 +145,6 @@ _ALL_DTYPES = tuple(
 @torch.library.custom_op("bucketing::_pre_bucket_all_gather", mutates_args={})
 def _pre_bucket_all_gather(
     ag_ins: list[torch.Tensor],
-    ag_input_numel: int,
     group_size: int,
     group_name: str,
     dtype: torch.dtype,  # type: ignore[name-defined]
@@ -243,7 +242,6 @@ def merge_all_gather_bucket(
 
     ag0 = ag_nodes[0]
     _, group_size, group_name = ag0.args
-    assert isinstance(group_name, str)
     bucket_ins: list[fx.Node] = []
     ag_pre_nodes: dict[fx.Node, list[fx.Node]] = defaultdict(list)
     out_dtypes: list[torch.dtype] = []

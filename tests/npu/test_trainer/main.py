@@ -9,7 +9,7 @@ from parallel_dims import ParallelizeDims
 from xpu_graph.utils import setup_logger, logger
 from tests.npu.test_trainer.parallelize import parallelize_model
 from tests.npu.test_dist_utils import set_dist_env, set_seed
-
+from xpu_graph.config import Target, OptLevel, XpuGraphConfig
 
 TORCH_DTYPE = torch.bfloat16
 torch.set_default_dtype(TORCH_DTYPE)
@@ -23,6 +23,15 @@ TRAIN_CONFIG = TrainConfig(
     loss_fn=torch.nn.CrossEntropyLoss(reduction="mean"),
     is_debug=True,
     device="npu",
+)
+XPU_GRAPH_CONFIG = XpuGraphConfig(
+    is_training=True,
+    freeze=False,
+    target=Target.npu,
+    opt_level=OptLevel.level1,
+    debug=True,
+    overlap_manual_scheduling=True,
+    vendor_compiler_config=None,
 )
 
 
@@ -73,6 +82,12 @@ def test_no_fsdp():
 
 
 def compare_weight(path1: str, path2: str):
+    if not os.path.exists(path1):
+        logger.error(f"path1: {path1} not exists")
+        return
+    if not os.path.exists(path2):
+        logger.error(f"path2: {path2} not exists")
+        return
     logger.info(f"begin compare weight, path1: {path1}, path2: {path2}")
     state_dict1 = torch.load(path1)
     state_dict2 = torch.load(path2)
@@ -139,7 +154,7 @@ def test_bucketing_and_reordering():
 if __name__ == "__main__":
     setup_logger(is_debug=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test", "-t", type=str, default="all", choices=["fsdp", "no_fsdp", "compare", "all"])
+    parser.add_argument("--test", "-t", type=str, default="all", choices=["fsdp", "no_fsdp", "all"])
     args = parser.parse_args()
     prepare_test_data()
     if args.test == "all":
@@ -148,5 +163,4 @@ if __name__ == "__main__":
         test_fsdp()
     elif args.test == "no_fsdp":
         test_no_fsdp()
-    elif args.test == "compare":
-        compare_weight(f"/tmp/test/no_fsdp.pt", f"/tmp/test/fsdp.pt")
+    compare_weight(f"/tmp/test/no_fsdp.pt", f"/tmp/test/fsdp.pt")

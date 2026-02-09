@@ -102,18 +102,11 @@ def get_transformer_block_buckets(model: Qwen3ForCausalLM) -> list[list[str] | s
 
 
 def compile_model(model: Qwen3ForCausalLM):
+    from .main import XPU_GRAPH_CONFIG
     module_bucket_plans = get_transformer_block_buckets(model)
     logger.info(f"module_bucket_plans: {module_bucket_plans}")
     xpu_graph_backend = XpuGraph(
-        XpuGraphConfig(
-            is_training=True,
-            freeze=False,
-            target=Target.npu,
-            opt_level=OptLevel.level1,
-            debug=True,
-            overlap_manual_scheduling=False,
-            vendor_compiler_config=None,
-        ),
+        XPU_GRAPH_CONFIG,
         module_bucket_plans=module_bucket_plans,
     )
     model = torch.compile(model, backend=xpu_graph_backend)
@@ -184,7 +177,8 @@ def train(rank, train_config):
         if not os.path.exists(folder) and rank == 0:
             os.makedirs(folder)
         save_dist_model(model, f"{folder}/fsdp.pt")
-        logger.info(f"Full state dict saved to {folder}/fsdp.pt")
+        if rank == 0:
+            logger.info(f"Full state dict saved to {folder}/fsdp.pt")
     else:
         if not os.path.exists(folder):
             os.makedirs(folder)

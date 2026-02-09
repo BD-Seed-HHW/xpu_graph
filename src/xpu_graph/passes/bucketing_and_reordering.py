@@ -4,27 +4,27 @@ import re
 from typing import Callable
 
 import torch
+import torch.fx as fx
+from torch.fx import map_arg, Node
 from torch.utils._ordered_set import OrderedSet
 
-from xpu_graph.config import OptLevel
 from xpu_graph.fx_utils import FxStage
 from xpu_graph.passes.optimizer import Optimizer
 
 import heapq
 from collections import Counter, defaultdict
 
-import torch
-import torch.fx as fx
-from torch.utils._ordered_set import OrderedSet
-from .bucketing import merge_all_gather_bucket, merge_reduce_scatter_bucket
 from .bucketing import (
     is_wait_tensor,
     bucket_key,
+    merge_all_gather_bucket,
+    merge_reduce_scatter_bucket,
     is_all_gather_into_tensor as is_all_gather,
     is_reduce_scatter_tensor as is_reduce_scatter
 )
-from torch.fx import map_arg, Node
 
+
+#  adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/overlap_manual_scheduling.py
 
 @dataclass
 class CollectiveInfo:
@@ -88,7 +88,7 @@ def _get_flat_args_unique(
     return args
 
 
-def _stable_topological_sort_impl(
+def _stable_topological_sort(
     graph: torch.fx.Graph,
     node_to_additional_deps: dict[Node, OrderedSet[Node]],
     do_sort: bool = True,
@@ -143,14 +143,7 @@ def _stable_topological_sort_impl(
     return not waiting and len(ready) == len(graph.nodes)
 
 
-def _stable_topological_sort(
-    graph: torch.fx.Graph,
-    node_to_additional_deps: dict[Node, OrderedSet[Node]],
-) -> None:
-    assert _stable_topological_sort_impl(graph, node_to_additional_deps)
-
-
-class ManualOverlapBucketer:
+class ManualBucketer:
     """
     Buckets collective operations based on user specifications.
     The actual bucket happens in bucket_collectives, where all-gathers/reduce-scatters in
@@ -226,7 +219,6 @@ class ManualOverlapBucketer:
         while next_node in coll_nodes:
             next_node = next_node.next
         if is_all_gather(first):
-            # default bucket mode: custom_ops, just pack some ops before all_gather to a new custom_op
             new_nodes, replacements = merge_all_gather_bucket(
                 self.graph,
                 coll_nodes,
@@ -234,7 +226,6 @@ class ManualOverlapBucketer:
                 insert_before=next_node,
             )
         elif is_reduce_scatter(first):
-            # default bucket mode: custom_ops, just pack some ops before reduce_scatter to a new custom_op
             new_nodes, replacements = merge_reduce_scatter_bucket(
                 self.graph,
                 coll_nodes,
@@ -245,16 +236,11 @@ class ManualOverlapBucketer:
             raise ValueError(
                 "bucket non all_gather/reduce_scatter node is not supported"
             )
-        # Identify the new wait and star
         new_waits = [n for n in new_nodes if _schedulable_wait_node(n)]
         assert len(new_waits) == 1, f"Expected exactly one new wait, got {new_waits}"
         new_wait = new_waits[0]
-        new_start = new_wait.args[0]
         for n in new_nodes:
-            if n == new_wait:
-                node_type = node_type + "_wait"
-            n.meta["manual_bucket_node_type"] = node_type
-            if "wait" in node_type:
+            if "wait" in n.meta.get("manual_bucket_node_type", ""):
                 self.wait_to_node_map[n] = new_wait
 
     def manual_bucket_collectives(self, nodes: list[fx.Node]) -> None:
@@ -301,7 +287,7 @@ class BucketingAndReordering(Optimizer):
 
     
     def process(self, gm: fx.GraphModule):
-        assert gm.graph.lint(), "Graph is not in topological order. Please ensure the graph is properly constructed."
+        gm.graph.lint()
         for node in gm.graph.nodes:
             if node.op == "call_function" and (node.target == torch.ops.bucketing._pre_bucket_all_gather or node.target == torch.ops.bucketing._pre_bucket_reduce_scatter):
                 return False
@@ -310,7 +296,7 @@ class BucketingAndReordering(Optimizer):
         self.collective_info: dict[fx.Node, CollectiveInfo] = {}
         self._identify_collectives()
         self.node_idx = {n: i for i, n in enumerate(self.graph.nodes)}
-        self.bucketer = ManualOverlapBucketer(
+        self.bucketer = ManualBucketer(
             graph=self.graph,
             collective_info=self.collective_info,
             node_idx=self.node_idx,
@@ -337,7 +323,6 @@ class BucketingAndReordering(Optimizer):
                 self.collective_info[start] = info
 
     def _schedule(self, node: fx.Node) -> None:
-        """Schedule a node."""
         assert node not in self.scheduled
         assert all(n in self.scheduled for n in node.all_input_nodes)
         self.scheduled.add(node)
@@ -348,18 +333,15 @@ class BucketingAndReordering(Optimizer):
 
     def _manual_reorder_graph(self) -> None:
         """
-        Reorder nodes in the FX graph to enforce manual overlap dependencies.
-
-        Enforce:
-        - all_gather_start_i depends on all_gather_wait_(i-1)
-        - reduce_scatter_wait_i must happen before reduce_scatter_start_(i+1)
+        
         """
         delayed_rs_nodes: list[fx.Node] = []
         overlap_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
-        self.node_idx = {n: i for i, n in enumerate(self.nodes)}
+        self.node_idx = {n: i for i, n in enumerate(self.graph.nodes)}
         self.scheduled = OrderedSet()
+        self.ready: list[tuple[int, fx.Node]] = []
 
-        for node in self.nodes:
+        for node in self.graph.nodes:
             if self.in_degree[node] == 0:
                 heapq.heappush(self.ready, (self.node_idx[node], node))
         # schedule reduce scatter normally in self._schedule
@@ -405,10 +387,8 @@ class BucketingAndReordering(Optimizer):
         _stable_topological_sort(self.graph, overlap_deps)
         self.graph.lint()
 
-    # bucketing 
     def _manual_bucket_collectives(self) -> None:
-        """Bucket nodes in each module_bucket from module_bucket_plans."""
-        self._get_nodes_in_plans(self.graph)
+        self._get_nodes_in_plans()
         for i, nodes in enumerate(self.nodes_in_plans):
             self.bucketer.manual_bucket_collectives(nodes=nodes)
 
