@@ -2,7 +2,6 @@ import torch
 import torch.fx as fx
 
 from xpu_graph.fx_utils import FxStage
-from xpu_graph.utils import logger
 
 
 class PassManager:

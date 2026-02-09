@@ -1,9 +1,11 @@
 import os
+from dataclasses import dataclass, field
+
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from dataclasses import dataclass, field
 from xpu_graph.utils import logger, setup_logger
-from tests.npu.test_dist_utils import dist_setup, cleanup
+
+from tests.npu.test_dist_utils import cleanup, dist_setup
 
 
 # Copied and simplified from torchtitan/distributed/parallel_dims.py

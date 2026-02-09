@@ -1,19 +1,18 @@
-import os, sys
+import os
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
-from parallel_dims import ParallelizeDims
-from modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
 import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
+from modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
+from parallel_dims import ParallelizeDims
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 from torch.utils.data import DataLoader, Dataset
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
-from tests.npu.test_dist_utils import dist_setup, cleanup
+from torch.utils.data.distributed import DistributedSampler
 from xpu_graph.compiler import XpuGraph
-from xpu_graph.config import OptLevel, Target, XpuGraphConfig
-
 from xpu_graph.utils import logger
+
+from tests.npu.test_dist_utils import cleanup, dist_setup
 
 
 @dataclass
@@ -45,7 +44,7 @@ class TrainConfig:
     warmup_steps: int = 100 # Number of warmup steps
     lr: float = 1 # Learning rate, because we use random dataset and random weight, so the lr must be a little bigger
 
-    loss_fn: Callable = None # Loss function to use for training    
+    loss_fn: Callable = None # Loss function to use for training
     seed : int = 111
 
 
@@ -110,7 +109,7 @@ def compile_model(model: Qwen3ForCausalLM):
         module_bucket_plans=module_bucket_plans,
     )
     model = torch.compile(model, backend=xpu_graph_backend)
-    logger.info(f"compile model successfully")
+    logger.info("compile model successfully")
     return model
 
 
@@ -143,7 +142,7 @@ def train(rank, train_config):
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
     loss_fn = train_config.loss_fn
     mini_batch_size = train_config.batch_size // dist.get_world_size() if dist.is_initialized() else train_config.batch_size
-    data_loader = get_dataloader(batch_size=mini_batch_size, 
+    data_loader = get_dataloader(batch_size=mini_batch_size,
                                         num_samples=train_config.num_samples,
                                         shuffle=train_config.shuffle,
                                         path=train_config.dataset_path)

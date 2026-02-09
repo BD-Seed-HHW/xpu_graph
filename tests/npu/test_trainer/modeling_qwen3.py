@@ -1,9 +1,10 @@
 from dataclasses import dataclass
-import torch
-from torch import nn
-import torch.nn.functional as F
 
+import torch
+import torch.nn.functional as F
+from torch import nn
 from xpu_graph.utils import logger, setup_logger
+
 from tests.npu.test_dist_utils import set_seed
 
 
@@ -22,7 +23,7 @@ class Qwen3ToyConfig:
     hidden_act: str = "silu"
     hidden_size: int = 1024
     initializer_range: float = 0.02
-    intermediate_size: int = 3072  
+    intermediate_size: int = 3072
     max_position_embeddings: int = 40960
     max_window_layers: int = 28
     model_type: str = "qwen3"
@@ -117,7 +118,7 @@ class Qwen3Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=True)  
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=True)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=True)
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 
@@ -154,7 +155,7 @@ class Qwen3Attention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
-    
+
     def init_weights(self, init_std):
         for linear in (self.q_proj, self.k_proj, self.v_proj):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -223,7 +224,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
-    
+
     def init_weights(self):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
             norm.reset_parameters()
@@ -293,14 +294,14 @@ class Qwen3Model(nn.Module):
 
         input_embeds = self.embed_tokens(input_ids)
         batch_size, seq_length = input_embeds.shape[:2]
-        
+
         position_ids = torch.arange(seq_length, dtype=torch.long, device=input_embeds.device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
         hidden_states = input_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        causal_mask = self.create_mask(seq_length, input_ids.device)        
-    
+        causal_mask = self.create_mask(seq_length, input_ids.device)
+
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
@@ -310,7 +311,7 @@ class Qwen3Model(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
-    
+
     def init_weights(self):
         if self.embed_tokens is not None:
             nn.init.normal_(self.embed_tokens.weight)

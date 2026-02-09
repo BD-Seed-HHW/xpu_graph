@@ -1,28 +1,21 @@
-from dataclasses import dataclass, field
-from enum import IntEnum
+import heapq
 import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from enum import IntEnum
 from typing import Callable
 
 import torch
 import torch.fx as fx
-from torch.fx import map_arg, Node
+from torch.fx import Node, map_arg
 from torch.utils._ordered_set import OrderedSet
 
 from xpu_graph.fx_utils import FxStage
 from xpu_graph.passes.optimizer import Optimizer
 
-import heapq
-from collections import Counter, defaultdict
-
-from .bucketing import (
-    is_wait_tensor,
-    bucket_key,
-    merge_all_gather_bucket,
-    merge_reduce_scatter_bucket,
-    is_all_gather_into_tensor as is_all_gather,
-    is_reduce_scatter_tensor as is_reduce_scatter
-)
-
+from .bucketing import bucket_key, is_wait_tensor, merge_all_gather_bucket, merge_reduce_scatter_bucket
+from .bucketing import is_all_gather_into_tensor as is_all_gather
+from .bucketing import is_reduce_scatter_tensor as is_reduce_scatter
 
 #  adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/overlap_manual_scheduling.py
 
@@ -265,7 +258,7 @@ class BucketingAndReordering(Optimizer):
     def __init__(self, module_bucket_plans: list[list[str] | str]):
         self.module_bucket_plans = module_bucket_plans
 
-    
+
     def process(self, gm: fx.GraphModule):
         gm.graph.lint()
         for node in gm.graph.nodes:
@@ -310,7 +303,7 @@ class BucketingAndReordering(Optimizer):
 
     def _manual_reorder_graph(self) -> None:
         """
-        
+
         """
         delayed_rs_nodes: list[fx.Node] = []
         overlap_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)

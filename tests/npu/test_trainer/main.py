@@ -1,15 +1,17 @@
-import os
 import argparse
+import os
+
 import pytest
 import torch
 import torch.multiprocessing as mp
-from tests.npu.test_trainer.train import TrainConfig, train
 from modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
 from parallel_dims import ParallelizeDims
-from xpu_graph.utils import setup_logger, logger
-from tests.npu.test_trainer.parallelize import parallelize_model
+from xpu_graph.config import OptLevel, Target, XpuGraphConfig
+from xpu_graph.utils import logger, setup_logger
+
 from tests.npu.test_dist_utils import set_dist_env, set_seed
-from xpu_graph.config import Target, OptLevel, XpuGraphConfig
+from tests.npu.test_trainer.parallelize import parallelize_model
+from tests.npu.test_trainer.train import TrainConfig, train
 
 TORCH_DTYPE = torch.bfloat16
 torch.set_default_dtype(TORCH_DTYPE)
@@ -36,7 +38,7 @@ XPU_GRAPH_CONFIG = XpuGraphConfig(
 
 
 def test_fsdp():
-    logger.info(f"begin test fsdp")
+    logger.info("begin test fsdp")
     set_seed(TRAIN_CONFIG.seed)
     set_dist_env()
     mp.set_start_method("spawn", force=True)
@@ -54,14 +56,14 @@ def test_fsdp():
     train_config.parallelize_fn = parallelize_model
     train_config.is_compile = True
     mp.spawn(
-        train, 
-        args=(train_config,), 
+        train,
+        args=(train_config,),
         nprocs=world_size_)
-    logger.info(f"fsdp training finished")
+    logger.info("fsdp training finished")
 
 
 def test_no_fsdp():
-    logger.info(f"begin test no-fsdp")
+    logger.info("begin test no-fsdp")
     set_seed(TRAIN_CONFIG.seed)
     mp.set_start_method("spawn", force=True)
     train_config = TRAIN_CONFIG
@@ -75,10 +77,10 @@ def test_no_fsdp():
         device=train_config.device,
     )
     mp.spawn(
-        train, 
-        args=(train_config,), 
+        train,
+        args=(train_config,),
         nprocs=1)
-    logger.info(f"no-fsdp training finished")
+    logger.info("no-fsdp training finished")
 
 
 def compare_weight(path1: str, path2: str):
@@ -132,12 +134,12 @@ def generate_weight_and_save(folder: str = "/tmp/test"):
 def test_all():
     test_no_fsdp()
     test_fsdp()
-    compare_weight(f"/tmp/test/fsdp.pt", f"/tmp/test/no_fsdp.pt")
+    compare_weight("/tmp/test/fsdp.pt", "/tmp/test/no_fsdp.pt")
 
 
 def prepare_test_data():
     if os.path.exists("/tmp/test") and os.path.exists(TRAIN_CONFIG.model_path) and os.path.exists(TRAIN_CONFIG.dataset_path):
-        logger.info(f"model weight and data already exists in folder /tmp/test")
+        logger.info("model weight and data already exists in folder /tmp/test")
     else:
         generate_data()
         generate_weight_and_save()
@@ -146,7 +148,7 @@ def prepare_test_data():
 @pytest.mark.exclusive
 def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
-    logger.info(f"begin test bucketing and reordering")
+    logger.info("begin test bucketing and reordering")
     prepare_test_data()
     test_all()
 
@@ -163,4 +165,4 @@ if __name__ == "__main__":
         test_fsdp()
     elif args.test == "no_fsdp":
         test_no_fsdp()
-    compare_weight(f"/tmp/test/no_fsdp.pt", f"/tmp/test/fsdp.pt")
+    compare_weight("/tmp/test/no_fsdp.pt", "/tmp/test/fsdp.pt")

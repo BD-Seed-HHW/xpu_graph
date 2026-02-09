@@ -3,9 +3,8 @@ from collections import defaultdict
 from typing import Literal, Optional, TypeAlias
 
 import torch
-from torch import fx
 import torch.distributed as dist
-
+from torch import fx
 
 # adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/bucketing.py
 
@@ -329,7 +328,7 @@ def merge_all_gather_bucket(
 
             old_wait = next(iter(ag_nodes[i].users))
             replacements[old_wait] = reshaped
-    
+
     if wait_insertion_point is not None:
         _move_nodes_after_wait_insertion_point(new_nodes, wait_insertion_point)
 
@@ -413,4 +412,3 @@ def merge_reduce_scatter_bucket(
 
     _erase_original_nodes(g, rs_nodes)
     return new_nodes, replacements
-

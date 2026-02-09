@@ -117,7 +117,7 @@ class XpuGraph:
                 if isinstance(xpu_compiled, SerializableArtifact):
                     # WARNING(liuyuan): MUST get the real artifact itself before return.
                     xpu_compiled = xpu_compiled.artifact
-                
+
                 if isinstance(xpu_compiled, torch.fx.GraphModule):
                     from .debugger import Debugger
                     xpu_compiled = Debugger(xpu_compiled).run
