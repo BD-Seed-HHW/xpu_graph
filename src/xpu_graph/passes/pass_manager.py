@@ -20,7 +20,7 @@ class PassManager:
 
         self._pattern_manager = PatternManager(self._config)
 
-        if self._config.overlap_manual_scheduling:
+        if self._config.bucketing_and_reordering:
             from .bucketing_and_reordering import BucketingAndReordering
 
             if BucketingAndReordering._opt_level <= self._config.opt_level:

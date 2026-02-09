@@ -32,7 +32,7 @@ XPU_GRAPH_CONFIG = XpuGraphConfig(
     target=Target.npu,
     opt_level=OptLevel.level1,
     debug=True,
-    overlap_manual_scheduling=True,
+    bucketing_and_reordering=True,
     vendor_compiler_config=None,
 )
 
