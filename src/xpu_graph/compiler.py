@@ -36,7 +36,6 @@ class XpuGraph:
         self,
         config: XpuGraphConfig,
         cache: XpuGraphCache = None,
-        *args,
         **kwargs,
     ):
         config._reset_config_with_env()
@@ -47,7 +46,7 @@ class XpuGraph:
         self._cache = cache if cache and config.enable_cache else default_cache() if config.enable_cache else None
         self._set_context()
         # WARNING(liuyuan): _pass_manager MUST be initilized after _set_context because triton kernel depends on environment varaibels that fetched in _set_context.
-        self._pass_manager = PassManager(self._config, *args, **kwargs)
+        self._pass_manager = PassManager(self._config, **kwargs)
         # NOTE(liuyuan): The plugin patterns should be placed before those built-in.
         self._pass_manager.get_pattern_manager().insert_patterns(
             chain.from_iterable(__PLUGIN_PATTERN_GROUP__.get(self._config.target, {}).values())
@@ -118,9 +117,6 @@ class XpuGraph:
                     # WARNING(liuyuan): MUST get the real artifact itself before return.
                     xpu_compiled = xpu_compiled.artifact
 
-                if isinstance(xpu_compiled, torch.fx.GraphModule):
-                    from .debugger import Debugger
-                    xpu_compiled = Debugger(xpu_compiled).run
             return xpu_compiled
 
         def wrapped(gm, sample_inputs):

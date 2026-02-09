@@ -5,7 +5,7 @@ from xpu_graph.fx_utils import FxStage
 
 
 class PassManager:
-    def __init__(self, config, *args, **kwargs):
+    def __init__(self, config, **kwargs):
         self._config = config
         self._stage = FxStage.inference
         self._passes = []
@@ -24,7 +24,7 @@ class PassManager:
             from .bucketing_and_reordering import BucketingAndReordering
 
             if BucketingAndReordering._opt_level <= self._config.opt_level:
-                assert "module_bucket_plans" in kwargs, "module_bucket_plans must be provided when overlap_manual_scheduling is enabled"
+                assert "module_bucket_plans" in kwargs, "module_bucket_plans must be provided when bucketing_and_reordering is enabled"
                 module_bucket_plans = kwargs.get("module_bucket_plans")
                 self._passes.append(BucketingAndReordering(module_bucket_plans=module_bucket_plans))
 
