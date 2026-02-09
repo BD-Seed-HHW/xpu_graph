@@ -16,7 +16,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import Placement, _StridedShard
-from utils import logger
+from xpu_graph.utils import logger
 
 _active_parametrization = True
 
