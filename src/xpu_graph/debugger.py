@@ -2,7 +2,7 @@ from typing import Any
 
 from torch.fx import Interpreter
 from torch.fx._compatibility import compatibility
-from torch.fx.node import Argument
+from torch.fx.node import Argument, Target
 
 
 class Debugger(Interpreter):
