@@ -6,7 +6,7 @@ from xpu_graph.utils import logger
 
 
 class PassManager:
-    def __init__(self, config):
+    def __init__(self, config, *args, **kwargs):
         self._config = config
         self._stage = FxStage.inference
         self._passes = []
@@ -20,6 +20,14 @@ class PassManager:
         from .patterns.pattern_manager import PatternManager
 
         self._pattern_manager = PatternManager(self._config)
+
+        if self._config.overlap_manual_scheduling:
+            from .bucketing_and_reordering import BucketingAndReordering
+
+            if BucketingAndReordering._opt_level <= self._config.opt_level:
+                assert "module_bucket_plans" in kwargs, "module_bucket_plans must be provided when overlap_manual_scheduling is enabled"
+                module_bucket_plans = kwargs.get("module_bucket_plans")
+                self._passes.append(BucketingAndReordering(module_bucket_plans=module_bucket_plans))
 
         from .remove_runtime_assertions import RemoveAssertions
 

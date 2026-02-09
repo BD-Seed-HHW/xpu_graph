@@ -36,6 +36,8 @@ class XpuGraph:
         self,
         config: XpuGraphConfig,
         cache: XpuGraphCache = None,
+        *args,
+        **kwargs,
     ):
         config._reset_config_with_env()
         self._config = config
@@ -45,7 +47,7 @@ class XpuGraph:
         self._cache = cache if cache and config.enable_cache else default_cache() if config.enable_cache else None
         self._set_context()
         # WARNING(liuyuan): _pass_manager MUST be initilized after _set_context because triton kernel depends on environment varaibels that fetched in _set_context.
-        self._pass_manager = PassManager(self._config)
+        self._pass_manager = PassManager(self._config, *args, **kwargs)
         # NOTE(liuyuan): The plugin patterns should be placed before those built-in.
         self._pass_manager.get_pattern_manager().insert_patterns(
             chain.from_iterable(__PLUGIN_PATTERN_GROUP__.get(self._config.target, {}).values())
@@ -115,6 +117,10 @@ class XpuGraph:
                 if isinstance(xpu_compiled, SerializableArtifact):
                     # WARNING(liuyuan): MUST get the real artifact itself before return.
                     xpu_compiled = xpu_compiled.artifact
+                
+                if isinstance(xpu_compiled, torch.fx.GraphModule):
+                    from .debugger import Debugger
+                    xpu_compiled = Debugger(xpu_compiled).run
             return xpu_compiled
 
         def wrapped(gm, sample_inputs):
@@ -152,6 +158,17 @@ class XpuGraph:
             else:
                 aot_config["fw_compiler"] = self._get_compiler(FxStage.inference)
                 aot_config["keep_inference_input_mutations"] = True
+            from torch import fx
+            def my_partition_fn(
+                joint_module: fx.GraphModule,
+                *args,
+                **kwargs,
+                ):
+                from xpu_graph.passes.reshard_after_forward import annotate_fsdp_all_gather
+                joint_module = annotate_fsdp_all_gather(joint_module, reshard_after_forward=True)
+                from torch._functorch.partitioners import default_partition
+                return default_partition(joint_module, *args, **kwargs)
+            aot_config["partition_fn"] = my_partition_fn
             xpu_gm = aot_autograd(**aot_config)(dynamo_gm, example_inputs)
             fw_metadata = None
         elif self._config.is_training:

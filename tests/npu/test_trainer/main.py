@@ -149,4 +149,4 @@ if __name__ == "__main__":
     elif args.test == "no_fsdp":
         test_no_fsdp()
     elif args.test == "compare":
-        compare_weight(f"/tmp/test/no_fsdp.pt", f"/tmp/test/weight.pt")
+        compare_weight(f"/tmp/test/no_fsdp.pt", f"/tmp/test/fsdp.pt")

@@ -168,7 +168,7 @@ def train(rank, train_config):
             loss = forward_backward_step(model, optimizer, loss_fn, data, target)
             total_loss += loss
             # if global_step % 5 == 0:
-            logger.info(f"rank[{rank}]: Epoch [{epoch}], Step [{global_step}], batch_idx[{batch_idx}], Loss: {loss:.4f}")
+            logger.info(f"rank[{rank}]: Epoch [{epoch}], Step [{global_step}], Loss: {loss:.4f}")
             n_batch += 1
             if global_step >= train_config.steps:
                 break
