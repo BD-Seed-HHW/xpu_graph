@@ -154,17 +154,6 @@ class XpuGraph:
             else:
                 aot_config["fw_compiler"] = self._get_compiler(FxStage.inference)
                 aot_config["keep_inference_input_mutations"] = True
-            from torch import fx
-            def my_partition_fn(
-                joint_module: fx.GraphModule,
-                *args,
-                **kwargs,
-                ):
-                from xpu_graph.passes.reshard_after_forward import annotate_fsdp_all_gather
-                joint_module = annotate_fsdp_all_gather(joint_module, reshard_after_forward=True)
-                from torch._functorch.partitioners import default_partition
-                return default_partition(joint_module, *args, **kwargs)
-            aot_config["partition_fn"] = my_partition_fn
             xpu_gm = aot_autograd(**aot_config)(dynamo_gm, example_inputs)
             fw_metadata = None
         elif self._config.is_training:
