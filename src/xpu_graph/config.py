@@ -57,6 +57,7 @@ class XpuGraphConfig:
         # If folding_freezed_params is False, XpuGraph will not fold freezed parameters and allow parameter hot-swapping
         True
     )
+    bucketing_and_reordering: bool = False
 
     # So far we only support configure "mode", because we mainly use "Inductor" as a vendor's compiler.
     # mode must be one of {"cudagraphs", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"},

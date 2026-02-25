@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch._dynamo.config as dynamo_config
-
 import xpu_graph
 from xpu_graph.config import OptLevel
 from xpu_graph.test_utils import is_similar, need_xpu_graph_logs

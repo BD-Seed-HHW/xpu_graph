@@ -1,5 +1,4 @@
 import torch
-
 from xpu_graph import mlu_compiler
 from xpu_graph.test_utils import is_similar, need_xpu_graph_logs, skip_xpu_graph_cache
 

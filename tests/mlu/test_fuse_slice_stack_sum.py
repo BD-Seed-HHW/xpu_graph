@@ -1,13 +1,12 @@
+# ruff: noqa: F841
+import pytest
 import torch
-import torch_mlu
-
 import xpu_graph
 from xpu_graph import OptLevel
 from xpu_graph.test_utils import is_similar, need_xpu_graph_logs, skip_xpu_graph_cache
 
 device = "mlu:0"
 aten = torch.ops.aten
-import pytest
 
 
 def fn0(arg41_1):

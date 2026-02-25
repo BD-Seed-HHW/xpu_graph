@@ -1,7 +1,7 @@
 import itertools
 from contextlib import nullcontext
 from enum import Enum
-from typing import Callable, Union
+from typing import Any, Callable, List, Optional, Union
 from unittest.mock import patch
 
 import torch
@@ -38,6 +38,7 @@ class FxStage(Enum):
     pregrad = "pregrad"
     forward = "forward"
     backward = "backward"
+    joint = "joint"
 
 
 def trace_and_inline(
@@ -74,10 +75,10 @@ def trace_and_inline(
     return inliner
 
 
-def fakify_tensors(full_args):
+def fakify_tensors(full_args, dynamic_shapes=True):
     fake_mode = detect_fake_mode(full_args)
     if fake_mode is None:
-        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+        fake_mode = FakeTensorMode(shape_env=ShapeEnv() if dynamic_shapes else None)
     fake_mode.allow_non_fake_inputs = True
     fake_flat_args = [
         fake_mode.from_tensor(x) if isinstance(x, torch.Tensor) and not isinstance(x, FakeTensor) else x
@@ -139,8 +140,6 @@ def _collect_params_and_inputs_info(gm, example_inputs):
     params_flat, params_spec = pytree.tree_flatten(params)
     params_flat = list(params_flat)
 
-    seen_sources = set()
-
     full_args = []
     # First, the params
     full_args.extend(params_flat)
@@ -148,41 +147,13 @@ def _collect_params_and_inputs_info(gm, example_inputs):
     if tracing_context := torch._guards.TracingContext.try_get():
         tracing_context.params_flat = params_flat
 
-    aot_autograd_arg_pos_to_source = None
-    # Then, the params 1:1 mapped sources, if relevant.
-    if hasattr(gm, "_param_name_to_source"):
-        aot_autograd_arg_pos_to_source = []
-        # We now know this came from dynamo, and (1) we care about guards,
-        # so setting up aot_autograd_arg_pos_to_source for downstream dedup guards
-        # can now be done safely. (2) Dynamo logic protects the 1:1 sizing below.
-        for name in params.keys():
-            assert name in gm._param_name_to_source, f"{name} not found."
-            source = gm._param_name_to_source[name]
-            assert source not in seen_sources, source
-            seen_sources.add(source)
-            aot_autograd_arg_pos_to_source.append(source)
-
     # Next, the input args
     full_args.extend(example_inputs)
 
-    static_input_indices = []
-    for pos, node in enumerate(find_nodes(gm.graph, op="placeholder")):
-        if hasattr(node, "_dynamo_source"):
-            if aot_autograd_arg_pos_to_source is None:
-                aot_autograd_arg_pos_to_source = []
-            source = node._dynamo_source
-            assert source not in seen_sources, source
-            seen_sources.add(source)
-            aot_autograd_arg_pos_to_source.append(source)
-            source_name = source.name() if source else str(source)
-
-            if "tensor_dict" in node.meta and node.meta["tensor_dict"].get("_dynamo_static_input_type", None):
-                static_input_indices.append(pos)
-            else:
-                logger.debug("Non-static input pos %s for source %s", pos, source_name)
-
-    if aot_autograd_arg_pos_to_source is not None:
-        assert len(full_args) == len(aot_autograd_arg_pos_to_source)
+    (
+        aot_autograd_arg_pos_to_source,
+        static_input_indices,
+    ) = _try_get_metadata_from_dynamo(gm, params.keys(), len(full_args))
 
     dynamic_shapes = False
     # Try to infer `dynamic_shapes from inputs and graph nodes
@@ -256,7 +227,7 @@ def _invoke_dispatcher(flat_fn, fake_flat_args, fake_mode, shape_env, aot_config
                 )
 
                 tensorify_python_scalars(dispatched_fn, fake_mode.shape_env, fake_mode)
-            except:
+            except ImportError:
                 logger.debug("Failed to tensorify python scalars, check the pytorch version")
     return dispatched_fn, fw_metadata
 
@@ -384,6 +355,194 @@ def get_disable_fake_mode():
             unset_fake_temporarily as disable_fake_mode,
         )
     return disable_fake_mode
+
+
+def _try_get_metadata_from_dynamo(
+    mod: torch.nn.Module, param_keys, full_args_num: int
+) -> tuple[Optional[list[torch._guards.Source]], list[int]]:
+    # Note(chenyifan): This function is backported from torch/_functorch/_aot_autograd/frontend_utils.py @HEAD
+    """
+    Metadata is forwarded from Dynamo to AOTDispatch via special fields on GraphModule.
+    We first verify that `mod` does come from Dynamo, then we handle cases where
+    metadata might be missing.
+
+    Returns:
+        aot_autograd_arg_pos_to_source: used to dedup params and their guards
+        static_input_indices: used to identify static inputs for cudagraphs
+    """
+    # Note [Assumption on Dynamo Metadata]
+    # This function assumes a graph module from dynamo provides `dynamo_compiled_id`,
+    # _param_name_to_source, and every placeholder node has `_dynamo_source` attributes.
+    # When gm is modified (e.g., DDPOptimizer via split_module), metadata needs to
+    # be propagated in order to be recognized as a dynamo graph
+
+    if not (isinstance(mod, torch.fx.GraphModule) and "dynamo_compile_id" in mod.meta):
+        # graph was not captured by dynamo
+        return None, []
+
+    if not hasattr(mod, "_param_name_to_source"):
+        # is from export
+        return None, []
+
+    # We now know this came from dynamo, and (1) we care about guards,
+    # so setting up aot_autograd_arg_pos_to_source for downstream dedup guards
+    # can now be done safely. (2) Dynamo logic protects the 1:1 sizing below.
+    # Additionally, we mark static indices for cudagraphs.
+    param_name_to_source = mod._param_name_to_source
+    seen_sources = set()
+
+    aot_autograd_arg_pos_to_source = []
+    static_input_indices = []
+    # Collect the new inputs lifted by aotdispatch
+    for i, name in enumerate(param_keys):
+        assert name in param_name_to_source, f"{name} not found."
+        source = param_name_to_source[name]
+        assert source not in seen_sources, source
+        seen_sources.add(source)
+        aot_autograd_arg_pos_to_source.append(source)
+
+        static_input_indices.append(i)
+
+    # Collect the dynamo graph inputs
+    # TODO(mlazos): Revisit if this is still needed. With Dynamo install ID
+    # matched tensors back into the Fx graph, this might not be necessary.
+    for pos, node in enumerate(mod.graph.find_nodes(op="placeholder")):
+        assert hasattr(node, "_dynamo_source")
+        source = node._dynamo_source
+        # `source`` specifies the source from user code. ddp optimizer may have
+        # intermediate values becoming submodule placeholders which does not
+        # have a source
+        assert source is None or source not in seen_sources, source
+        seen_sources.add(source)
+        aot_autograd_arg_pos_to_source.append(source)
+        source_name = source.name() if source else str(source)
+
+        # input[i] in dynamo is now:
+        # input[i + len(extra_params)] in AOT,
+        # where extra_params are the params/buffers that dynamo baked into the
+        # OutputGraph
+        actual_pos = pos + len(param_keys)
+
+        if "tensor_dict" in node.meta and node.meta["tensor_dict"].get("_dynamo_static_input_type", None):
+            logger.debug("Adding static input pos %s for source %s", actual_pos, source_name)
+            static_input_indices.append(actual_pos)
+        else:
+            logger.debug("Non-static input pos %s for source %s", actual_pos, source_name)
+
+    assert full_args_num == len(aot_autograd_arg_pos_to_source)
+    return aot_autograd_arg_pos_to_source, static_input_indices
+
+
+def prepare_for_dispatch(
+    gm: torch.fx.GraphModule,
+    example_inputs: List[Any],
+    *,
+    decompositions=None,
+    keep_infrence_mutations=True,
+):
+    # Note(chenyifan): this function references torch/_functorch/aot_autograd.py: prepare_aot_module_simplified @HEAD
+    """Prepare a graph module for dispatch.
+
+    Args:
+        gm (torch.fx.GraphModule): The graph module to prepare.
+        example_inputs (List[torch.Tensor]): The example inputs to use for tracing.
+        decompositions (Optional[Dict[Callable, Callable]]): The decompositions to use for dispatching.
+        keep_infrence_mutations (bool): Whether to keep the inference mutations in the dispatched graph.
+
+    Returns:
+        torch.fx.GraphModule: The prepared graph module
+    """
+
+    # Reference: torch/_functorch/aot_autograd.py: prepare_aot_module_simplified @HEAD
+    #   1. lift gm paramters and buffers
+    #   2. collect subclass-tensor info and unwrap them
+    #   3. collect input-output metadata
+    # construct basic aot_config with collected infos
+    params_buffers = {
+        **dict(gm.named_parameters(remove_duplicate=False)),
+        **dict(gm.named_buffers(remove_duplicate=False)),
+    }
+    params_buffers_flat, params_buffers_spec = pytree.tree_flatten(params_buffers)
+    params_buffers_flat = list(params_buffers_flat)
+    params_buffers_len = len(params_buffers_flat)
+
+    flat_fn = create_functional_call(gm, params_buffers_spec, params_buffers_len, store_orig_mod=True)
+
+    full_args = [*params_buffers_flat, *example_inputs]
+
+    if tracing_context := torch._guards.TracingContext.try_get():
+        tracing_context.params_flat = params_buffers_flat
+
+    (
+        aot_autograd_arg_pos_to_source,
+        static_input_indices,
+    ) = _try_get_metadata_from_dynamo(gm, params_buffers.keys(), len(full_args))
+
+    dynamic_shapes = False
+    # Try to infer `dynamic_shapes` from inputs and graph nodes
+    fake_mode = detect_fake_mode(full_args)
+    if fake_mode is None and hasattr(gm, "_orig_mod") and isinstance(gm._orig_mod, torch.fx.GraphModule):
+        vals = [node.meta["val"] for node in gm._orig_mod.graph.nodes if "val" in node.meta]
+        fake_mode = detect_fake_mode(vals)
+    dynamic_shapes = fake_mode is not None and fake_mode.shape_env is not None
+
+    aot_config = AOTConfig(
+        fw_compiler=None,
+        bw_compiler=None,
+        inference_compiler=None,
+        partition_fn=None,
+        decompositions=decompositions or {},
+        num_params_buffers=params_buffers_len,
+        aot_id=next(FX_COUNT),
+        keep_inference_input_mutations=keep_infrence_mutations,  # Note(chenyifan): always keep mutations in graph (for further Re-Inplace optimizations)
+        dynamic_shapes=dynamic_shapes,
+        aot_autograd_arg_pos_to_source=aot_autograd_arg_pos_to_source,
+        static_input_indices=static_input_indices,
+        is_export=False,
+        pre_dispatch=False,
+        no_tangents=False,
+    )
+
+    fake_mode, fake_flat_args = fakify_tensors(full_args, dynamic_shapes=dynamic_shapes)
+    return flat_fn, params_buffers_flat, fake_flat_args, aot_config, fake_mode
+
+
+def freeze_compile(dynamo_gm, aot_graph_module, example_args, *, inner_compiler=None):
+    can_unlift = True
+    for name, param in dynamo_gm.named_parameters(remove_duplicate=False):
+        if _is_subclass_input(param):
+            logger.debug("Found subclass input %s, cannot unlift", name)
+            can_unlift = False
+            break
+    for name, buffer in dynamo_gm.named_buffers(remove_duplicate=False):
+        if _is_subclass_input(buffer):
+            logger.debug("Found subclass input %s, cannot unlift", name)
+            can_unlift = False
+            break
+    if can_unlift:
+        unlifted_nodes = _unlift_params(dynamo_gm, aot_graph_module)
+        num_params = len([node for node in unlifted_nodes if node.op != "placeholder"])
+        aot_graph_module.graph.lint()
+        aot_graph_module.recompile()
+    if inner_compiler is not None:
+        compiled = inner_compiler(aot_graph_module, example_args[num_params:])
+    else:
+        compiled = aot_graph_module
+
+    if can_unlift:
+
+        def freeze_wrapper(full_args):
+            unfreezed_args = list(full_args[num_params:])
+            full_args.clear()
+            if not hasattr(compiled, "_boxed_call"):
+                return compiled(*unfreezed_args)
+            return compiled(unfreezed_args)
+
+        freeze_wrapper._boxed_call = True
+
+        return freeze_wrapper
+
+    return compiled
 
 
 def _get_wrapped_constant(node: fx.Node):

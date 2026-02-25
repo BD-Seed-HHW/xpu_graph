@@ -1,7 +1,5 @@
 import pytest
 import torch
-import torch_npu
-
 from xpu_graph.compiler import Target, XpuGraph, XpuGraphConfig
 
 
@@ -49,7 +47,6 @@ class TestDeviceGraphCompiler:
     def test_compiler_partitioning_mixed_ops(self):
         import torch
         from torch.fx.experimental.proxy_tensor import make_fx
-
         from xpu_graph.backends.device_graph import device_graph_compiler
 
         class MixedModel(torch.nn.Module):

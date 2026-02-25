@@ -2,11 +2,10 @@ import torch
 import torch.fx as fx
 
 from xpu_graph.fx_utils import FxStage
-from xpu_graph.utils import logger
 
 
 class PassManager:
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         self._config = config
         self._stage = FxStage.inference
         self._passes = []
@@ -20,6 +19,18 @@ class PassManager:
         from .patterns.pattern_manager import PatternManager
 
         self._pattern_manager = PatternManager(self._config)
+
+        if self._config.bucketing_and_reordering:
+            from .bucketing_and_reordering import BucketingAndReordering
+            from .reshard_after_forward import ReshardAfterForward
+
+            if ReshardAfterForward._opt_level <= self._config.opt_level:
+                self._passes.append(ReshardAfterForward())
+
+            if BucketingAndReordering._opt_level <= self._config.opt_level:
+                assert "module_bucket_plans" in kwargs, "module_bucket_plans must be provided when bucketing_and_reordering is enabled"
+                module_bucket_plans = kwargs.get("module_bucket_plans")
+                self._passes.append(BucketingAndReordering(module_bucket_plans=module_bucket_plans))
 
         from .remove_runtime_assertions import RemoveAssertions
 
