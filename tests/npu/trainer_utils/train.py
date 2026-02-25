@@ -4,8 +4,6 @@ from typing import Callable
 
 import torch
 import torch.distributed as dist
-from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
-from .parallel_dims import ParallelizeDims
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -13,6 +11,9 @@ from xpu_graph.compiler import XpuGraph
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import cleanup, dist_setup
+
+from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
+from .parallel_dims import ParallelizeDims
 
 
 @dataclass

@@ -8,10 +8,14 @@ from xpu_graph.config import OptLevel, Target, XpuGraphConfig
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_dist_env, set_seed
-from tests.npu.trainer_utils import Qwen3ForCausalLM, Qwen3ToyConfig
-from tests.npu.trainer_utils import ParallelizeDims
-from tests.npu.trainer_utils import parallelize_model
-from tests.npu.trainer_utils import TrainConfig, train
+from tests.npu.trainer_utils import (
+    ParallelizeDims,
+    Qwen3ForCausalLM,
+    Qwen3ToyConfig,
+    TrainConfig,
+    parallelize_model,
+    train,
+)
 
 TORCH_DTYPE = torch.bfloat16
 torch.set_default_dtype(TORCH_DTYPE)

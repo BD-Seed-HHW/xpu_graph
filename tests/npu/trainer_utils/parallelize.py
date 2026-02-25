@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from .parallel_dims import ParallelizeDims
 from torch.distributed._tensor import (
     DTensor,
     Partial,
@@ -17,6 +16,8 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import Placement, _StridedShard
 from xpu_graph.utils import logger
+
+from .parallel_dims import ParallelizeDims
 
 _active_parametrization = True
 
