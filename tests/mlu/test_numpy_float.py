@@ -1,7 +1,5 @@
 import numpy as np
 import torch
-import torch_mlu
-
 import xpu_graph
 
 device = "mlu:0"

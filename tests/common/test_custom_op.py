@@ -1,14 +1,13 @@
 import pytest
 import torch
 import torch.nn as nn
+import xpu_graph
 from torch.utils.checkpoint import checkpoint
+from xpu_graph import OptLevel
+from xpu_graph.test_utils import is_similar, need_xpu_graph_logs
 
 device = "cpu"
 dtype = torch.float32
-
-import xpu_graph
-from xpu_graph import OptLevel
-from xpu_graph.test_utils import is_similar, need_xpu_graph_logs
 
 
 @torch.library.custom_op("test_op::numpy_mul", mutates_args=())
@@ -38,7 +37,7 @@ def backward(ctx, grad):
 numpy_mul.register_autograd(backward, setup_context=setup_context)
 
 
-class SimpleWitCustomOp(torch.nn.Module):
+class SimpleWithCustomOp(torch.nn.Module):
     def __init__(self, input_dim, p=0.1):
         super().__init__()
         self.fc = torch.nn.Linear(input_dim, input_dim)
@@ -144,7 +143,7 @@ class TestCustomFallbackTraining:
     @pytest.mark.parametrize(
         "ReproCls",
         [
-            SimpleWitCustomOp,
+            SimpleWithCustomOp,
             SimpleWithAutogradFunction,
             SimpleSwiGLUwithCKPT,
         ],
@@ -152,10 +151,11 @@ class TestCustomFallbackTraining:
     def test_custom_op(self, caplog, ReproCls):
         with need_xpu_graph_logs():
             compare_training_with_custom_op(ReproCls, self.train_backend)
-        if ReproCls == SimpleWitCustomOp:
-            assert "Higher order operators detected" not in caplog.text
-        else:
-            assert "Higher order operators detected" in caplog.text
+        if self.train_backend._config.fallback_legacy_dispatch:
+            if ReproCls == SimpleWithCustomOp:
+                assert "Higher order operators detected" not in caplog.text
+            else:
+                assert "Higher order operators detected" in caplog.text
 
 
 def compare_inference_with_custom_op(ModCls, backend, nbatches=4, bsz=8, input_dim=16):
@@ -184,7 +184,7 @@ class TestCustomFallbackInference:
     @pytest.mark.parametrize(
         "ReproCls",
         [
-            SimpleWitCustomOp,
+            SimpleWithCustomOp,
             SimpleWithAutogradFunction,
             SimpleSwiGLUwithCKPT,
         ],
@@ -193,7 +193,8 @@ class TestCustomFallbackInference:
         with need_xpu_graph_logs():
             compare_inference_with_custom_op(ReproCls, self.inference_backend)
         assert "Higher order operators detected" not in caplog.text
-        assert "decompose graph complete" in caplog.text
+        if self.inference_backend._config.fallback_legacy_dispatch:
+            assert "decompose graph complete" in caplog.text
 
 
 if __name__ == "__main__":

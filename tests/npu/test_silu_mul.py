@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-
 from xpu_graph import OptLevel, Target, XpuGraph, XpuGraphConfig
 from xpu_graph.accuracy_utils import assert_close, benchmark_compare_close
 
