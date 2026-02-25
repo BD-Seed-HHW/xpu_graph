@@ -4,12 +4,12 @@ import os
 import pytest
 import torch
 import torch.multiprocessing as mp
-from tests.npu.trainer_utils.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
-from tests.npu.trainer_utils.parallel_dims import ParallelizeDims
 from xpu_graph.config import OptLevel, Target, XpuGraphConfig
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_dist_env, set_seed
+from tests.npu.trainer_utils.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
+from tests.npu.trainer_utils.parallel_dims import ParallelizeDims
 from tests.npu.trainer_utils.parallelize import parallelize_model
 from tests.npu.trainer_utils.train import TrainConfig, train
 
