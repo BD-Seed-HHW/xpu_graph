@@ -26,6 +26,10 @@ def env_dispatch(request):
     yield
     m.undo()
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "env_settings(configs): mark test to run with specific environment configurations"
+    )
 
 def pytest_generate_tests(metafunc):
     if "env_dispatch" in metafunc.fixturenames:
