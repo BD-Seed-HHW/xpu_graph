@@ -1,3 +1,4 @@
+# ruff: noqa: F821, F841
 import torch
 import xpu_graph
 from xpu_graph.config import OptLevel

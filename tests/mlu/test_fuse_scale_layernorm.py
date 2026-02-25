@@ -1,3 +1,4 @@
+# ruff: noqa: F841
 import pytest
 import torch
 import xpu_graph

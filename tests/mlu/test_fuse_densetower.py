@@ -2,14 +2,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 import xpu_graph
-from xpu_graph.test_utils import is_similar
+from xpu_graph.config import OptLevel
+from xpu_graph.test_utils import is_similar, need_xpu_graph_logs, skip_xpu_graph_cache
 
 aten = torch.ops.aten
 device = "mlu:0"
 dtype = torch.float16
-
-from xpu_graph.config import OptLevel
-from xpu_graph.test_utils import is_similar, need_xpu_graph_logs, skip_xpu_graph_cache
 
 
 def fn0(ffn_input, ffn_weight1, ffn_weight2, ffn_weight3, bias1, bias2, bias3, act1, act2, act3):

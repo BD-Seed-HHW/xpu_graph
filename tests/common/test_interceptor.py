@@ -1,8 +1,5 @@
 import pytest
 import torch
-
-aten = torch.ops.aten
-
 import xpu_graph
 from xpu_graph import OptLevel
 from xpu_graph.fx_utils import FxStage
@@ -11,6 +8,8 @@ from xpu_graph.passes.patterns.pattern import Pattern
 from xpu_graph.test_utils import need_xpu_graph_logs
 
 from tests.common.test_models import InplaceModel, compare_inference, compare_training
+
+aten = torch.ops.aten
 
 DISPATCH_ENV_CONFIGS = [
     {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},

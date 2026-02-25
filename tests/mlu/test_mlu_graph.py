@@ -1,6 +1,6 @@
 import pytest
 import torch
-from xpu_graph.compiler import Target, XpuGraph, XpuGraphConfig
+from xpu_graph.compiler import XpuGraph, XpuGraphConfig
 from xpu_graph.config import Target
 from xpu_graph.device_graph_runner import GraphRunner
 
