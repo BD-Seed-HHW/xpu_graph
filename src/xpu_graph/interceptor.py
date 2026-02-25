@@ -6,6 +6,7 @@ from typing import Callable
 import torch
 from torch.fx import GraphModule
 from torch.nn import Module
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from xpu_graph.config import get_dump_dir
 from xpu_graph.utils import logger
@@ -125,8 +126,13 @@ class FunctionInterceptor:
                 trgt_inputs = base_inputs
 
             # execute the trgt func first to restore rng state
-            with torch.random.fork_rng(device_type=torch._utils._get_available_device_type()):
+            if (device_type := torch._utils._get_available_device_type()) is not None:
+                with torch.random.fork_rng(device_type=device_type):
+                    trgt_outputs = _invoke_inference(trgt_func, trgt_inputs)
+            else:
+                rng_state = torch.random.get_rng_state()
                 trgt_outputs = _invoke_inference(trgt_func, trgt_inputs)
+                torch.random.set_rng_state(rng_state)
 
             base_outputs = _invoke_inference(base_func, base_inputs)
             input_diverge_cnt = 0
@@ -219,8 +225,13 @@ class AutogradInterceptor:
                     trgt_inputs = copy.deepcopy(base_inputs)
                 else:
                     trgt_inputs = base_inputs
-                with torch.random.fork_rng(device_type=torch._utils._get_available_device_type()):
+                if (device_type := torch._utils._get_available_device_type()) is not None:
+                    with torch.random.fork_rng(device_type=device_type):
+                        trgt_outputs = _invoke_forward(trgt_func, trgt_inputs)
+                else:
+                    rng_state = torch.random.get_rng_state()
                     trgt_outputs = _invoke_forward(trgt_func, trgt_inputs)
+                    torch.random.set_rng_state(rng_state)
 
                 base_outputs = _invoke_forward(base_func, base_inputs)
                 input_diverge_cnt = 0
@@ -359,9 +370,6 @@ class AutogradInterceptor:
         return monitored_forward
 
 
-from torch.utils._python_dispatch import TorchDispatchMode
-
-
 class OpInterceptor(TorchDispatchMode):
     def __init__(self, golden_funcs, mark=None, dispatch_key=None, **check_configs):
         super().__init__(dispatch_key)
@@ -376,8 +384,13 @@ class OpInterceptor(TorchDispatchMode):
 
             actual_inputs = args
             golden_inputs = copy.deepcopy(actual_inputs)
-            with torch.random.fork_rng(device_type=torch._utils._get_available_device_type()):
+            if (device_type := torch._utils._get_available_device_type()) is not None:
+                with torch.random.fork_rng(device_type=device_type):
+                    golden_outputs = golden_fn(*golden_inputs, **(kwargs or {}))
+            else:
+                rng_state = torch.random.get_rng_state()
                 golden_outputs = golden_fn(*golden_inputs, **(kwargs or {}))
+                torch.random.set_rng_state(rng_state)
             actual_outputs = func(*args, **(kwargs or {}))
             input_diverge_cnt = compare_tensor_list(actual_inputs, golden_inputs, **self.check_configs)
             output_diverge_cnt = compare_tensor_list(actual_outputs, golden_outputs, **self.check_configs)

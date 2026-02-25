@@ -1,19 +1,26 @@
 import pytest
 import torch
-
 import xpu_graph
-from tests.common.test_models import all_models, compare_inference
 from xpu_graph import OptLevel
-from xpu_graph.test_utils import is_similar, need_xpu_graph_logs, skip_xpu_graph_cache
+from xpu_graph.test_utils import need_xpu_graph_logs, skip_xpu_graph_cache
+
+from tests.common.test_models import all_models, compare_inference
+
+DISPATCH_ENV_CONFIGS = [
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+]
 
 device = "cpu"
 data_type = torch.float32
 
 
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestInference:
-    def setup_class(self):
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
         infer_config = xpu_graph.XpuGraphConfig(is_training=False, opt_level=OptLevel.level2, freeze=False)
-        self.infer_backend = xpu_graph.XpuGraph(infer_config)
+        request.cls.infer_backend = xpu_graph.XpuGraph(infer_config)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -24,11 +31,13 @@ class TestInference:
             compare_inference(device, data_type, ReproCls, self.infer_backend)
 
 
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestFreezeInference:
-    def setup_class(self):
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
         freeze_config = xpu_graph.XpuGraphConfig(is_training=False, opt_level=OptLevel.level2, freeze=True)
         # Warning: DO NOT create both freeze and non-freeze in the same test case,
-        self.freeze_backend = xpu_graph.XpuGraph(freeze_config)
+        request.cls.freeze_backend = xpu_graph.XpuGraph(freeze_config)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -39,12 +48,14 @@ class TestFreezeInference:
             compare_inference(device, data_type, ReproCls, self.freeze_backend)
 
 
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestInferenceWithInterceptor:
-    def setup_class(self):
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
         infer_config = xpu_graph.XpuGraphConfig(
             is_training=False, opt_level=OptLevel.level2, freeze=False, enable_interceptor="rtol=1e-6,atol=1e-5"
         )
-        self.infer_backend = xpu_graph.XpuGraph(infer_config)
+        request.cls.infer_backend = xpu_graph.XpuGraph(infer_config)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -57,13 +68,15 @@ class TestInferenceWithInterceptor:
             assert "diverges" not in caplog.text
 
 
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestFreezeInferenceWithInterceptor:
-    def setup_class(self):
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
         freeze_config = xpu_graph.XpuGraphConfig(
             is_training=False, opt_level=OptLevel.level2, freeze=True, enable_interceptor="rtol=1e-6,atol=1e-5"
         )
         # Warning: DO NOT create both freeze and non-freeze in the same test case,
-        self.freeze_backend = xpu_graph.XpuGraph(freeze_config)
+        request.cls.freeze_backend = xpu_graph.XpuGraph(freeze_config)
 
     @pytest.mark.parametrize(
         "ReproCls",

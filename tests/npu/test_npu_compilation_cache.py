@@ -1,8 +1,5 @@
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.fx.experimental.proxy_tensor import make_fx
-
 from xpu_graph import Target
 from xpu_graph.backends.npu import NpuSerializableArtifact
 from xpu_graph.cache import XpuGraphLocalCache

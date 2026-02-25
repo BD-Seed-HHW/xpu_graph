@@ -3,9 +3,10 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
 import xpu_graph
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from xpu_graph.config import OptLevel
+
 from tests.mlu.test_dist_utils import (
     MainModel,
     cleanup,
@@ -13,7 +14,6 @@ from tests.mlu.test_dist_utils import (
     get_dp_dataloader,
     set_dist_env,
 )
-from xpu_graph.config import OptLevel
 
 
 def train(rank, world_size, do_compile, return_queue, ModCls, model_path):
@@ -95,7 +95,15 @@ def fsdp_test(ModCls, model_path="fsdp_model.pth"):
 
 
 @pytest.mark.exclusive
+@pytest.mark.env_settings([
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+])
 class TestFSDP:
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_env(self, env_dispatch, request):
+        pass
+
     @pytest.mark.parametrize(
         "PatternModel",
         [

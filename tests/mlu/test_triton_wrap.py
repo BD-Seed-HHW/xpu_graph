@@ -4,7 +4,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-
 import xpu_graph
 from xpu_graph.test_utils import need_xpu_graph_logs, skip_xpu_graph_cache
 from xpu_graph.utils import __XPU_GRAPH_ENVS__

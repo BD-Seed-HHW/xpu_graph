@@ -1,8 +1,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import torch_mlu
-
 import xpu_graph
 from xpu_graph.test_utils import is_similar
 

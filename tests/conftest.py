@@ -1,4 +1,3 @@
-import os
 
 import pytest
 import torch
@@ -13,14 +12,23 @@ def reset_dynamo():
         torch._dynamo.reset()
 
 
-@pytest.fixture(params=["0", "1"], scope="module", autouse=True)
+DEFAULT_ENV_CONFIGS = [{}]
+
+
+@pytest.fixture(scope="class")
 def env_dispatch(request):
-    try:
-        orig_val = os.environ.get("XPUGRAPH_FALLBACK_LEGACY_DISPATCH", None)
-        os.environ["XPUGRAPH_FALLBACK_LEGACY_DISPATCH"] = request.param
-        yield request.param
-    finally:
-        if orig_val is not None:
-            os.environ["XPUGRAPH_FALLBACK_LEGACY_DISPATCH"] = orig_val
-        else:
-            del os.environ["XPUGRAPH_FALLBACK_LEGACY_DISPATCH"]
+    from _pytest.monkeypatch import MonkeyPatch
+
+    m = MonkeyPatch()
+    for k, v in request.param.items():
+        m.setenv(k, v)
+
+    yield
+    m.undo()
+
+
+def pytest_generate_tests(metafunc):
+    if "env_dispatch" in metafunc.fixturenames:
+        marker = metafunc.definition.get_closest_marker("env_settings")
+        env_configs = marker.args[0] if marker is not None else DEFAULT_ENV_CONFIGS
+        metafunc.parametrize("env_dispatch", env_configs, indirect=True, scope="class")

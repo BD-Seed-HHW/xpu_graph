@@ -1,7 +1,6 @@
 import torch
-
 from xpu_graph import OptLevel, Target, XpuGraph, XpuGraphConfig
-from xpu_graph.test_utils import is_similar, need_xpu_graph_logs
+from xpu_graph.test_utils import need_xpu_graph_logs
 
 
 class TestSuperKernelScope:

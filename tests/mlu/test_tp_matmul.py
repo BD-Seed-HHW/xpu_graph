@@ -3,14 +3,15 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
+import xpu_graph
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
 )
+from xpu_graph.config import OptLevel
 
-import xpu_graph
 from tests.mlu.test_dist_utils import (
     MainModel,
     cleanup,
@@ -18,7 +19,6 @@ from tests.mlu.test_dist_utils import (
     get_dp_dataloader,
     set_dist_env,
 )
-from xpu_graph.config import OptLevel
 
 
 def train(rank, world_size, do_compile, return_queue, ModCls, model_path):
@@ -145,7 +145,15 @@ def tp_test(ModCls, is_training=True, model_path="tp_model.pth"):
 
 
 @pytest.mark.exclusive
+@pytest.mark.env_settings([
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+])
 class TestTP:
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_env(self, env_dispatch, request):
+        pass
+
     @pytest.mark.parametrize(
         "PatternModel",
         [

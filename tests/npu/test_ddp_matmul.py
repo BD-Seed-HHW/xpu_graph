@@ -4,6 +4,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
+from xpu_graph import OptLevel, Target, XpuGraph, XpuGraphConfig
 
 from tests.npu.test_dist_utils import (
     MainModel,
@@ -12,7 +13,6 @@ from tests.npu.test_dist_utils import (
     get_dp_dataloader,
     set_dist_env,
 )
-from xpu_graph import OptLevel, Target, XpuGraph, XpuGraphConfig
 
 
 def train(rank, world_size, do_compile, return_queue, ModCls, model_path):
@@ -101,7 +101,15 @@ def ddp_test(ModCls, model_path="ddp_model.pth"):
 
 
 @pytest.mark.exclusive
+@pytest.mark.env_settings([
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+])
 class TestDDP:
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_env(self, env_dispatch, request):
+        pass
+
     @pytest.mark.parametrize(
         "PatternModel",
         [
