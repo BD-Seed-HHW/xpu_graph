@@ -13,9 +13,9 @@ from torch.utils._ordered_set import OrderedSet
 from xpu_graph.fx_utils import FxStage
 from xpu_graph.passes.optimizer import Optimizer
 
-from .bucketing import bucket_key, is_wait_tensor, merge_all_gather_bucket, merge_reduce_scatter_bucket
-from .bucketing import is_all_gather_into_tensor as is_all_gather
-from .bucketing import is_reduce_scatter_tensor as is_reduce_scatter
+from .bucketing_utils import bucket_key, is_wait_tensor, merge_all_gather_bucket, merge_reduce_scatter_bucket
+from .bucketing_utils import is_all_gather_into_tensor as is_all_gather
+from .bucketing_utils import is_reduce_scatter_tensor as is_reduce_scatter
 
 #  adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/overlap_manual_scheduling.py
 

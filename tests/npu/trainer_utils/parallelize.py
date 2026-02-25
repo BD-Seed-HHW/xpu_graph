@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from parallel_dims import ParallelizeDims
+from .parallel_dims import ParallelizeDims
 from torch.distributed._tensor import (
     DTensor,
     Partial,

@@ -8,10 +8,10 @@ from xpu_graph.config import OptLevel, Target, XpuGraphConfig
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_dist_env, set_seed
-from tests.npu.trainer_utils.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
-from tests.npu.trainer_utils.parallel_dims import ParallelizeDims
-from tests.npu.trainer_utils.parallelize import parallelize_model
-from tests.npu.trainer_utils.train import TrainConfig, train
+from tests.npu.trainer_utils import Qwen3ForCausalLM, Qwen3ToyConfig
+from tests.npu.trainer_utils import ParallelizeDims
+from tests.npu.trainer_utils import parallelize_model
+from tests.npu.trainer_utils import TrainConfig, train
 
 TORCH_DTYPE = torch.bfloat16
 torch.set_default_dtype(TORCH_DTYPE)
@@ -132,12 +132,6 @@ def generate_weight_and_save(folder: str = "/tmp/test"):
     logger.info(f"save generate weight to {folder}/weight.pt")
 
 
-def test_all():
-    test_no_fsdp()
-    test_fsdp()
-    compare_weight("/tmp/test/fsdp.pt", "/tmp/test/no_fsdp.pt")
-
-
 def prepare_test_data():
     if os.path.exists("/tmp/test") and os.path.exists(TRAIN_CONFIG.model_path) and os.path.exists(TRAIN_CONFIG.dataset_path):
         logger.info("model weight and data already exists in folder /tmp/test")
@@ -151,7 +145,9 @@ def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
     logger.info("begin test bucketing and reordering")
     prepare_test_data()
-    test_all()
+    test_no_fsdp()
+    test_fsdp()
+    compare_weight("/tmp/test/fsdp.pt", "/tmp/test/no_fsdp.pt")
 
 
 if __name__ == "__main__":
@@ -161,7 +157,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     prepare_test_data()
     if args.test == "all":
-        test_all()
+        test_no_fsdp()
+        test_fsdp()
     elif args.test == "fsdp":
         test_fsdp()
     elif args.test == "no_fsdp":
