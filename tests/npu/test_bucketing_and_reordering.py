@@ -4,14 +4,14 @@ import os
 import pytest
 import torch
 import torch.multiprocessing as mp
-from modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
-from parallel_dims import ParallelizeDims
+from tests.npu.trainer_utils.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
+from tests.npu.trainer_utils.parallel_dims import ParallelizeDims
 from xpu_graph.config import OptLevel, Target, XpuGraphConfig
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_dist_env, set_seed
-from tests.npu.test_trainer.parallelize import parallelize_model
-from tests.npu.test_trainer.train import TrainConfig, train
+from tests.npu.trainer_utils.parallelize import parallelize_model
+from tests.npu.trainer_utils.train import TrainConfig, train
 
 TORCH_DTYPE = torch.bfloat16
 torch.set_default_dtype(TORCH_DTYPE)
@@ -26,6 +26,7 @@ TRAIN_CONFIG = TrainConfig(
     is_debug=True,
     device="npu",
 )
+
 XPU_GRAPH_CONFIG = XpuGraphConfig(
     is_training=True,
     freeze=False,

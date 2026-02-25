@@ -101,7 +101,7 @@ def get_transformer_block_buckets(model: Qwen3ForCausalLM) -> list[list[str] | s
 
 
 def compile_model(model: Qwen3ForCausalLM):
-    from .main import XPU_GRAPH_CONFIG
+    from ..test_bucketing_and_reordering import XPU_GRAPH_CONFIG
     module_bucket_plans = get_transformer_block_buckets(model)
     logger.info(f"module_bucket_plans: {module_bucket_plans}")
     xpu_graph_backend = XpuGraph(
