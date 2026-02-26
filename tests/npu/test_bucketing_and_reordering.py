@@ -8,7 +8,7 @@ from xpu_graph.config import OptLevel, Target, XpuGraphConfig
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_dist_env, set_seed
-from tests.npu.trainer_utils import (
+from tests.npu.train_utils import (
     ParallelizeDims,
     Qwen3ForCausalLM,
     Qwen3ToyConfig,
@@ -29,6 +29,7 @@ TRAIN_CONFIG = TrainConfig(
     loss_fn=torch.nn.CrossEntropyLoss(reduction="mean"),
     is_debug=True,
     device="npu",
+    steps=200,
 )
 
 XPU_GRAPH_CONFIG = XpuGraphConfig(
@@ -37,12 +38,12 @@ XPU_GRAPH_CONFIG = XpuGraphConfig(
     target=Target.npu,
     opt_level=OptLevel.level1,
     debug=True,
-    bucketing_and_reordering=True,
+    bucketing_and_reordering=False,
     vendor_compiler_config=None,
 )
 
 
-def test_fsdp():
+def test_fsdp(path: str = "/tmp/test/fsdp.pt"):
     logger.info("begin test fsdp")
     set_seed(TRAIN_CONFIG.seed)
     set_dist_env()
@@ -62,12 +63,19 @@ def test_fsdp():
     train_config.is_compile = True
     mp.spawn(
         train,
-        args=(train_config,),
+        args=(train_config, path),
         nprocs=world_size_)
     logger.info("fsdp training finished")
 
 
-def test_no_fsdp():
+def test_fsdp_bucketing_and_reordering():
+    logger.info("begin test fsdp bucketing and reordering")
+    XPU_GRAPH_CONFIG.bucketing_and_reordering = True
+    test_fsdp("/tmp/test/fsdp_bucketing_and_reordering.pt")
+    XPU_GRAPH_CONFIG.bucketing_and_reordering = False
+
+
+def test_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
     logger.info("begin test no-fsdp")
     set_seed(TRAIN_CONFIG.seed)
     mp.set_start_method("spawn", force=True)
@@ -83,12 +91,12 @@ def test_no_fsdp():
     )
     mp.spawn(
         train,
-        args=(train_config,),
+        args=(train_config, path),
         nprocs=1)
     logger.info("no-fsdp training finished")
 
 
-def compare_weight(path1: str, path2: str):
+def compare_weight(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-4):
     if not os.path.exists(path1):
         logger.error(f"path1: {path1} not exists")
         return
@@ -96,19 +104,24 @@ def compare_weight(path1: str, path2: str):
         logger.error(f"path2: {path2} not exists")
         return
     logger.info(f"begin compare weight, path1: {path1}, path2: {path2}")
-    state_dict1 = torch.load(path1)
-    state_dict2 = torch.load(path2)
+    state_dict1 = torch.load(path1, map_location="cpu")
+    state_dict2 = torch.load(path2, map_location="cpu")
     assert state_dict1.keys() == state_dict2.keys(), "two state_dict keys are not equal"
     equal = True
     for k in state_dict1.keys():
         tensor1 = state_dict1[k]
         tensor2 = state_dict2[k]
-        if not torch.allclose(tensor1, tensor2, atol=1e-4, rtol=1e-4):
-            max_diff = torch.max(torch.abs(tensor1 - tensor2))
-            num_diff = torch.sum(torch.abs(tensor1 - tensor2) > 1e-4)
-            logger.error("max_diff: %s, num_diff: %s, weight %s is not close, tensor1.dtype: %s, tensor2.dtype: %s\ntensor1: %s \ntensor2: %s", max_diff, num_diff, k, tensor1.dtype, tensor2.dtype, tensor1, tensor2)
+        tensor1 = tensor1.detach().float().cpu()
+        tensor2 = tensor2.detach().float().cpu()
+        diff = (tensor1 - tensor2).abs()
+        thr = atol + rtol * tensor2.abs()
+        bad = diff > thr
+
+        max_diff = diff.max().item()
+        num_bad = bad.sum().item()
+        if num_bad != 0:
+            logger.error("max_diff: %s, num_bad: %s, weight %s is not close", max_diff, num_bad, k)
             equal = False
-            break
         else:
             logger.info("weight %s is close", k)
     if equal:
@@ -149,9 +162,9 @@ def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
     logger.info("begin test bucketing and reordering")
     prepare_test_data()
-    test_no_fsdp()
     test_fsdp()
-    compare_weight("/tmp/test/fsdp.pt", "/tmp/test/no_fsdp.pt")
+    test_bucketing_and_reordering()
+    compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/no_fsdp.pt")
 
 
 if __name__ == "__main__":
@@ -163,8 +176,10 @@ if __name__ == "__main__":
     if args.test == "all":
         test_no_fsdp()
         test_fsdp()
+        compare_weight("/tmp/test/no_fsdp.pt", "/tmp/test/fsdp.pt", atol=0.0, rtol=0.0)
     elif args.test == "fsdp":
         test_fsdp()
+        test_fsdp_bucketing_and_reordering()
+        compare_weight("/tmp/test/fsdp.pt", "/tmp/test/fsdp_bucketing_and_reordering.pt", atol=0.0, rtol=0.0)
     elif args.test == "no_fsdp":
         test_no_fsdp()
-    compare_weight("/tmp/test/no_fsdp.pt", "/tmp/test/fsdp.pt")

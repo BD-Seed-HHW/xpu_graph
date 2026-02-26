@@ -114,7 +114,7 @@ def compile_model(model: Qwen3ForCausalLM):
     return model
 
 
-def forward_backward_step(model, optimizer, loss_fn, data, target):
+def forward_backward_step(model, optimizer, loss_fn, data, target, rank):
     optimizer.zero_grad()
     logits = model(data)
     shift_logits = logits[:, :-1, :].contiguous()
@@ -127,11 +127,35 @@ def forward_backward_step(model, optimizer, loss_fn, data, target):
     )
 
     loss.backward()
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # if global_step == 126 and rank == 0:
+        # print(f"global_step: {global_step}")
+        # logger.info(f"{optimizer.param_groups=}")
     optimizer.step()
-    return loss
+    '''
+    save_dir = "/tmp/train_debug"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+
+    optimizer_state = {
+        "state": {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv
+                      for sk, sv in v.items()}
+                 for k, v in optimizer.state.items()},
+        "param_groups": optimizer.param_groups,
+    }
+    torch.save(optimizer_state, f"{save_dir}/optimizer_state_rank{rank}.pt")
+
+    gradients = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            gradients[name] = param.grad.detach().cpu()
+    torch.save(gradients, f"{save_dir}/gradients_rank{rank}.pt")
+    '''
+
+    return loss.detach()
 
 
-def train(rank, train_config):
+def train(rank, train_config, path):
     setup_logger(is_debug=True)
     rank = rank
     model = Qwen3ForCausalLM(train_config.model_config)
@@ -150,6 +174,7 @@ def train(rank, train_config):
                                         path=train_config.dataset_path)
     model.train().to(train_config.device)
     torch.set_grad_enabled(True)
+    global global_step
     global_step = 0
     for epoch in range(train_config.epochs):
         total_loss = 0.0
@@ -159,7 +184,7 @@ def train(rank, train_config):
         for batch_idx, (data, target) in enumerate(data_loader):
             global_step += 1
             data, target = data.to(train_config.device), target.to(train_config.device)
-            loss = forward_backward_step(model, optimizer, loss_fn, data, target)
+            loss = forward_backward_step(model, optimizer, loss_fn, data, target, rank)
             total_loss += loss
             logger.info(f"rank[{rank}]: Epoch [{epoch}], Step [{global_step}], Loss: {loss:.4f}")
             n_batch += 1
@@ -172,19 +197,20 @@ def train(rank, train_config):
         logger.info(f"rank[{rank}]: Epoch [{epoch}], Loss: {total_loss:.4f}")
         if global_step >= train_config.steps:
             break
-    folder = "/tmp/test"
+    folder = os.path.dirname(path)
     if dist.is_initialized():
         if not os.path.exists(folder) and rank == 0:
             os.makedirs(folder)
-        save_dist_model(model, f"{folder}/fsdp.pt")
+        save_dist_model(model, path)
+
         if rank == 0:
-            logger.info(f"Full state dict saved to {folder}/fsdp.pt")
+            logger.info(f"Full state dict saved to {path}")
     else:
         if not os.path.exists(folder):
             os.makedirs(folder)
         sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-        torch.save(sd, f"{folder}/no_fsdp.pt")
-        logger.info(f"Full state dict saved to {folder}/no_fsdp.pt")
+        torch.save(sd, path)
+        logger.info(f"Full state dict saved to {path}")
     if dist.is_initialized():
         dist.barrier()
         cleanup()

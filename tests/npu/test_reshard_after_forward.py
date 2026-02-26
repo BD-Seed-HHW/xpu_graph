@@ -39,7 +39,7 @@ class TestReshardAfterForward:
             (all_gather_node,)
         )
 
-        output_node = graph.output(wait_tensor_node)
+        graph.output(wait_tensor_node)
 
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -71,7 +71,7 @@ class TestReshardAfterForward:
             (wait_tensor_node, 0, 0, 10)
         )
 
-        output_node = graph.output(slice_node)
+        graph.output(slice_node)
 
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -101,7 +101,7 @@ class TestReshardAfterForward:
             (all_gather_node,)
         )
 
-        output_node = graph.output(wait_tensor_node)
+        graph.output(wait_tensor_node)
 
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
