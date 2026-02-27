@@ -128,6 +128,52 @@ def compare_weight(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-
         logger.info("two state_dict weights are close")
 
 
+def compare_grad_xors(path1: str, path2: str):
+    if not os.path.exists(path1):
+        logger.error(f"path1: {path1} not exists")
+        return False
+    if not os.path.exists(path2):
+        logger.error(f"path2: {path2} not exists")
+        return False
+    logger.info(f"begin compare grad xors, path1: {path1}, path2: {path2}")
+    grad_xors1 = torch.load(path1, map_location="cpu")
+    grad_xors2 = torch.load(path2, map_location="cpu")
+
+    steps1 = set(grad_xors1.keys())
+    steps2 = set(grad_xors2.keys())
+    if steps1 != steps2:
+        logger.error(f"steps mismatch: {steps1} vs {steps2}")
+        return False
+
+    all_equal = True
+    for step in sorted(steps1):
+        xors1 = grad_xors1[step]
+        xors2 = grad_xors2[step]
+
+        params1 = set(xors1.keys())
+        params2 = set(xors2.keys())
+        if params1 != params2:
+            logger.error(f"step {step}: param names mismatch")
+            all_equal = False
+            continue
+
+        step_equal = True
+        for param_name in sorted(params1):
+            if xors1[param_name] != xors2[param_name]:
+                logger.error(
+                    f"step {step}, param {param_name}: xor mismatch {xors1[param_name]} vs {xors2[param_name]}"
+                )
+                step_equal = False
+                all_equal = False
+
+        if step_equal:
+            logger.info(f"step {step}: all grad xors match")
+
+    if all_equal:
+        logger.info("all grad xors are equal")
+    return all_equal
+
+
 def generate_data(folder: str = "/tmp/test"):
     vocab_size = TRAIN_CONFIG.model_config.vocab_size
     seq_len = TRAIN_CONFIG.max_seq_len
@@ -181,5 +227,6 @@ if __name__ == "__main__":
         test_fsdp()
         test_fsdp_bucketing_and_reordering()
         compare_weight("/tmp/test/fsdp.pt", "/tmp/test/fsdp_bucketing_and_reordering.pt", atol=0.0, rtol=0.0)
+        compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt")
     elif args.test == "no_fsdp":
         test_no_fsdp()

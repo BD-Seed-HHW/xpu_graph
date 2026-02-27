@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from functools import reduce
 from typing import Callable
 
 import torch
@@ -14,6 +15,20 @@ from tests.npu.test_dist_utils import cleanup, dist_setup
 
 from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
 from .parallel_dims import ParallelizeDims
+
+
+def compute_tensor_xor(tensor: torch.Tensor) -> int:
+    int8_data = tensor.detach().cpu().view(torch.int8).flatten().to_local()
+    xor_result = reduce(lambda x, y: x ^ y, int8_data.tolist(), 0)
+    return xor_result
+
+
+def compute_grad_xors(model) -> dict:
+    grad_xors = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_xors[name] = compute_tensor_xor(param.grad)
+    return grad_xors
 
 
 @dataclass
@@ -127,32 +142,12 @@ def forward_backward_step(model, optimizer, loss_fn, data, target, rank):
     )
 
     loss.backward()
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    # if global_step == 126 and rank == 0:
-        # print(f"global_step: {global_step}")
-        # logger.info(f"{optimizer.param_groups=}")
+
+    grad_xors = compute_grad_xors(model)
+
     optimizer.step()
-    '''
-    save_dir = "/tmp/train_debug"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
 
-    optimizer_state = {
-        "state": {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv
-                      for sk, sv in v.items()}
-                 for k, v in optimizer.state.items()},
-        "param_groups": optimizer.param_groups,
-    }
-    torch.save(optimizer_state, f"{save_dir}/optimizer_state_rank{rank}.pt")
-
-    gradients = {}
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            gradients[name] = param.grad.detach().cpu()
-    torch.save(gradients, f"{save_dir}/gradients_rank{rank}.pt")
-    '''
-
-    return loss.detach()
+    return loss.detach(), grad_xors
 
 
 def train(rank, train_config, path):
@@ -176,6 +171,9 @@ def train(rank, train_config, path):
     torch.set_grad_enabled(True)
     global global_step
     global_step = 0
+
+    all_grad_xors = {}
+
     for epoch in range(train_config.epochs):
         total_loss = 0.0
         n_batch = 0
@@ -184,7 +182,8 @@ def train(rank, train_config, path):
         for batch_idx, (data, target) in enumerate(data_loader):
             global_step += 1
             data, target = data.to(train_config.device), target.to(train_config.device)
-            loss = forward_backward_step(model, optimizer, loss_fn, data, target, rank)
+            loss, grad_xors = forward_backward_step(model, optimizer, loss_fn, data, target, rank)
+            all_grad_xors[global_step] = grad_xors
             total_loss += loss
             logger.info(f"rank[{rank}]: Epoch [{epoch}], Step [{global_step}], Loss: {loss:.4f}")
             n_batch += 1
@@ -197,11 +196,17 @@ def train(rank, train_config, path):
         logger.info(f"rank[{rank}]: Epoch [{epoch}], Loss: {total_loss:.4f}")
         if global_step >= train_config.steps:
             break
+
     folder = os.path.dirname(path)
+    filename = os.path.basename(path)
     if dist.is_initialized():
         if not os.path.exists(folder) and rank == 0:
             os.makedirs(folder)
+        dist.barrier()
         save_dist_model(model, path)
+        grad_xor_path = os.path.join(folder, f"{filename.split('.')[0]}_grad_rank{rank}.pt")
+        torch.save(all_grad_xors, grad_xor_path)
+        logger.info(f"rank[{rank}]: Grad xors saved to {grad_xor_path}")
 
         if rank == 0:
             logger.info(f"Full state dict saved to {path}")
@@ -210,7 +215,10 @@ def train(rank, train_config, path):
             os.makedirs(folder)
         sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
         torch.save(sd, path)
+        grad_xor_path = os.path.join(folder, "grad_xors.pt")
+        torch.save(all_grad_xors, grad_xor_path)
         logger.info(f"Full state dict saved to {path}")
+        logger.info(f"Grad xors saved to {grad_xor_path}")
     if dist.is_initialized():
         dist.barrier()
         cleanup()
