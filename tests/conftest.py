@@ -1,3 +1,4 @@
+
 import pytest
 import torch
 
@@ -11,14 +12,27 @@ def reset_dynamo():
         torch._dynamo.reset()
 
 
-@pytest.fixture(scope="class", autouse=True)
-def class_env_setup(request):
-    if hasattr(request, "param"):
-        env_vars = request.param
+DEFAULT_ENV_CONFIGS = [{}]
 
-        with pytest.MonkeyPatch.context() as mp:
-            for key, value in env_vars.items():
-                mp.setenv(key, value)
-            yield env_vars
-    else:
-        yield {}
+
+@pytest.fixture(scope="class")
+def env_dispatch(request):
+    from _pytest.monkeypatch import MonkeyPatch
+
+    m = MonkeyPatch()
+    for k, v in request.param.items():
+        m.setenv(k, v)
+
+    yield
+    m.undo()
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "env_settings(configs): mark test to run with specific environment configurations"
+    )
+
+def pytest_generate_tests(metafunc):
+    if "env_dispatch" in metafunc.fixturenames:
+        marker = metafunc.definition.get_closest_marker("env_settings")
+        env_configs = marker.args[0] if marker is not None else DEFAULT_ENV_CONFIGS
+        metafunc.parametrize("env_dispatch", env_configs, indirect=True, scope="class")

@@ -1,3 +1,4 @@
+
 import pytest
 import torch
 import xpu_graph
@@ -100,7 +101,7 @@ class TestLayerNorm:
         [naive_layer_norm, complex_func],
     )
     def test_layernrom_patterns_with_loss_and_grad(self, caplog, pattern_func, act_dtype, param_dtype, grad_dtype):
-        if not self.train_backend._config.fallback_legacy_dispatch:
+        if self.train_backend._config.fallback_legacy_dispatch is False:
             pytest.skip("Pregrad passes will be replaced with joint passes")
         with need_xpu_graph_logs(), skip_xpu_graph_cache(self.train_backend):
             layernorm_test_with_loss_and_grad(self.train_backend, pattern_func, act_dtype, param_dtype, grad_dtype)

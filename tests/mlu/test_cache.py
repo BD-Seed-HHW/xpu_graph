@@ -7,8 +7,7 @@ import torch
 from xpu_graph import OptLevel, mlu_compiler
 from xpu_graph.test_utils import need_xpu_graph_logs
 
-from tests.test_models import SimpleModel, compare_inference
-from tests.utils import parametrize_class_env
+from tests.common.test_models import SimpleModel, compare_inference
 
 device = "mlu"
 dtype = torch.float32
@@ -46,6 +45,9 @@ def test_xpugraph_inference_artifact_picklizable(caplog, tmp_path, use_inductor)
         infer_backend = mlu_compiler(
             is_training=False, opt_level=OptLevel.level2, freeze=False, cache=tmp_path, vendor_compiler_config=None
         )
+
+    if infer_backend._config.fallback_legacy_dispatch is False:
+        pytest.skip("Test only for Non AotAutograd mode")
 
     compiled_id = itertools.count()
 

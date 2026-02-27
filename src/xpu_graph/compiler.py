@@ -60,7 +60,7 @@ class XpuGraph:
             fake_mode, fake_inputs = fakify_tensors(fake_inputs)
 
             with fake_mode:
-                if self._config.enable_cache:
+                if self._config.enable_cache and stage != FxStage.joint:
                     hashkey = self._cache.cache_key(gm, fake_inputs, self._config, stage)
                     cached_compiled = self._cache.load_artifact(hashkey)
                     if cached_compiled is not None:
@@ -108,7 +108,6 @@ class XpuGraph:
                     xpu_compiled = SerializableGraphModule(xpu_compiled)
 
                 if self._config.enable_cache and stage != FxStage.joint:
-                    # Note(chenyifan): Disable cache for FxStage.joint for now, as it drops necessary meta info for parition_fn
                     if isinstance(xpu_compiled, SerializableArtifact):
                         xpu_compiled = self._cache.save_artifact(hashkey, xpu_compiled)
                     else:
@@ -199,13 +198,11 @@ class XpuGraph:
 
         return xpu_gm, fw_metadata
 
-    def _dispatch_and_compile(self, dynamo_gm, example_inputs):
-        logger.debug(
-            "before compile: graph like:\n %s",
-            dynamo_gm.print_readable(print_output=False, include_stride=True, include_device=True),
-        )
+    def _dispatch_and_compile(self, dynamo_gm, example_inputs, *args, **kwargs):
         aot_config = {}
         aot_config["keep_inference_input_mutations"] = True
+        aot_config["fw_compiler"] = self._get_compiler(FxStage.forward)
+        aot_config["bw_compiler"] = self._get_compiler(FxStage.backward)
 
         def partition_fn(joint_gm, joint_args, *, num_fwd_outputs):
             new_joint_gm = self._get_compiler(FxStage.joint)(joint_gm, joint_args)
@@ -224,11 +221,6 @@ class XpuGraph:
         else:
             aot_config["inference_compiler"] = self._get_compiler(FxStage.inference)
 
-        aot_config["fw_compiler"] = (
-            self._get_compiler(FxStage.forward) if self._config.is_training else aot_config["inference_compiler"]
-        )
-        aot_config["bw_compiler"] = self._get_compiler(FxStage.backward)
-
         compiled = aot_autograd(**aot_config)(dynamo_gm, example_inputs)
 
         if tracing_context := torch._guards.TracingContext.try_get():
@@ -238,7 +230,7 @@ class XpuGraph:
 
         return compiled, fw_metadata
 
-    def __call__(self, dynamo_gm, example_inputs, **kwargs):
+    def __call__(self, dynamo_gm, example_inputs, *args, **kwargs):
         logger.info(f"{self._config}")
 
         if self._config.fallback_legacy_dispatch:
@@ -351,8 +343,7 @@ class XpuGraphCompiler:
 
         return chained_setter
 
-    def prior_work(self):
-        ...
+    def prior_work(self): ...
 
     def done(self):
         self._compiler = XpuGraph(self._config)

@@ -1,13 +1,6 @@
-import numpy as np
-import pytest
 import torch
 import torch._dynamo.config
-import torch_npu
-import triton
-import triton.language as tl
-from torch import fx, nn
-
-import xpu_graph
+from torch import nn
 from xpu_graph import OptLevel, Target, XpuGraph, XpuGraphConfig
 from xpu_graph.accuracy_utils import assert_close, benchmark_compare_close
 from xpu_graph.test_utils import need_xpu_graph_logs

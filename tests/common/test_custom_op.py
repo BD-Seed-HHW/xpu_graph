@@ -37,7 +37,7 @@ def backward(ctx, grad):
 numpy_mul.register_autograd(backward, setup_context=setup_context)
 
 
-class SimpleWitCustomOp(torch.nn.Module):
+class SimpleWithCustomOp(torch.nn.Module):
     def __init__(self, input_dim, p=0.1):
         super().__init__()
         self.fc = torch.nn.Linear(input_dim, input_dim)
@@ -143,7 +143,7 @@ class TestCustomFallbackTraining:
     @pytest.mark.parametrize(
         "ReproCls",
         [
-            SimpleWitCustomOp,
+            SimpleWithCustomOp,
             SimpleWithAutogradFunction,
             SimpleSwiGLUwithCKPT,
         ],
@@ -152,7 +152,7 @@ class TestCustomFallbackTraining:
         with need_xpu_graph_logs():
             compare_training_with_custom_op(ReproCls, self.train_backend)
         if self.train_backend._config.fallback_legacy_dispatch:
-            if ReproCls == SimpleWitCustomOp:
+            if ReproCls == SimpleWithCustomOp:
                 assert "Higher order operators detected" not in caplog.text
             else:
                 assert "Higher order operators detected" in caplog.text
@@ -184,7 +184,7 @@ class TestCustomFallbackInference:
     @pytest.mark.parametrize(
         "ReproCls",
         [
-            SimpleWitCustomOp,
+            SimpleWithCustomOp,
             SimpleWithAutogradFunction,
             SimpleSwiGLUwithCKPT,
         ],
@@ -192,8 +192,8 @@ class TestCustomFallbackInference:
     def test_custom_op(self, caplog, ReproCls):
         with need_xpu_graph_logs():
             compare_inference_with_custom_op(ReproCls, self.inference_backend)
+        assert "Higher order operators detected" not in caplog.text
         if self.inference_backend._config.fallback_legacy_dispatch:
-            assert "Higher order operators detected" not in caplog.text
             assert "decompose graph complete" in caplog.text
 
 

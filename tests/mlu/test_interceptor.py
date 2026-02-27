@@ -7,10 +7,15 @@ from xpu_graph.interceptor import OpInterceptor
 from xpu_graph.passes.patterns.pattern import Pattern
 from xpu_graph.test_utils import need_xpu_graph_logs
 
-from tests.test_models import InplaceModel, compare_inference, compare_training
-from tests.utils import parametrize_class_env
+from tests.common.test_models import InplaceModel, compare_inference, compare_training
 
 aten = torch.ops.aten
+
+DISPATCH_ENV_CONFIGS = [
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+]
+
 device = "mlu"
 data_type = torch.float32
 
@@ -59,22 +64,18 @@ class FaultyPattern(Pattern):
         return changed
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestInferenceInterceptorUseGolden:
-    def setup_class(self):
-        self.infer_backend = xpu_graph.mlu_compiler(
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.infer_backend = xpu_graph.mlu_compiler(
             is_training=False,
             opt_level=OptLevel.level2,
             freeze=False,
             enable_interceptor="rtol=1e-6,atol=1e-5,use_golden=1",
         )
-        self.faulty_pattern = FaultyPattern()
-        self.infer_backend.get_pattern_manager().register_pattern(self.faulty_pattern)
+        request.cls.faulty_pattern = FaultyPattern()
+        request.cls.infer_backend.get_pattern_manager().register_pattern(request.cls.faulty_pattern)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -86,22 +87,18 @@ class TestInferenceInterceptorUseGolden:
         assert "The inference pass diverges" in caplog.text
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestInferenceInterceptorUseActual:
-    def setup_class(self):
-        self.infer_backend = xpu_graph.mlu_compiler(
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.infer_backend = xpu_graph.mlu_compiler(
             is_training=False,
             opt_level=OptLevel.level2,
             freeze=False,
             enable_interceptor="rtol=1e-6,atol=1e-5,use_golden=0",
         )
-        self.faulty_pattern = FaultyPattern()
-        self.infer_backend.get_pattern_manager().register_pattern(self.faulty_pattern)
+        request.cls.faulty_pattern = FaultyPattern()
+        request.cls.infer_backend.get_pattern_manager().register_pattern(request.cls.faulty_pattern)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -114,22 +111,18 @@ class TestInferenceInterceptorUseActual:
         assert "The inference pass diverges" in caplog.text
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestTrainingInterceptorUseGolden:
-    def setup_class(self):
-        self.train_backend = xpu_graph.mlu_compiler(
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.train_backend = xpu_graph.mlu_compiler(
             is_training=True,
             opt_level=OptLevel.level2,
             freeze=False,
             enable_interceptor="rtol=1e-6,atol=1e-5,use_golden=1",
         )
-        self.faulty_pattern = FaultyPattern()
-        self.train_backend.get_pattern_manager().register_pattern(self.faulty_pattern)
+        request.cls.faulty_pattern = FaultyPattern()
+        request.cls.train_backend.get_pattern_manager().register_pattern(request.cls.faulty_pattern)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -146,22 +139,18 @@ class TestTrainingInterceptorUseGolden:
             assert "The forward pass diverges" in caplog.text
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestTrainingInterceptorUseActual:
-    def setup_class(self):
-        self.train_backend = xpu_graph.mlu_compiler(
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.train_backend = xpu_graph.mlu_compiler(
             is_training=True,
             opt_level=OptLevel.level2,
             freeze=False,
             enable_interceptor="rtol=1e-6,atol=1e-5,use_golden=0",
         )
-        self.faulty_pattern = FaultyPattern()
-        self.train_backend.get_pattern_manager().register_pattern(self.faulty_pattern)
+        request.cls.faulty_pattern = FaultyPattern()
+        request.cls.train_backend.get_pattern_manager().register_pattern(request.cls.faulty_pattern)
 
     @pytest.mark.parametrize(
         "ReproCls",

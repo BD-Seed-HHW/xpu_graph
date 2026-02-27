@@ -1,7 +1,5 @@
 import pytest
 import torch
-import torch_npu
-
 from xpu_graph.compiler import Target, XpuGraph, XpuGraphConfig
 
 

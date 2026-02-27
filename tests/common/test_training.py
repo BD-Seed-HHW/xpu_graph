@@ -4,23 +4,23 @@ import xpu_graph
 from xpu_graph import OptLevel
 from xpu_graph.test_utils import need_xpu_graph_logs
 
-from tests.test_models import SimpleModel, all_models, compare_training
-from tests.utils import parametrize_class_env
+from tests.common.test_models import SimpleModel, all_models, compare_training
+
+DISPATCH_ENV_CONFIGS = [
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+]
 
 device = "cpu"
 data_type = torch.float32
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestTraining:
-    def setup_class(self):
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
         train_config = xpu_graph.XpuGraphConfig(is_training=True, opt_level=OptLevel.level1, freeze=False)
-        self.train_backend = xpu_graph.XpuGraph(train_config)
+        request.cls.train_backend = xpu_graph.XpuGraph(train_config)
 
     @pytest.mark.parametrize(
         "ReproCls",

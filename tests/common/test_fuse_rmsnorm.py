@@ -1,3 +1,4 @@
+
 import pytest
 import torch
 import xpu_graph
@@ -142,7 +143,7 @@ class TestRMSNorm:
     def test_rmsnorm_patterns_with_loss_and_grad(
         self, caplog, pattern_func, input_dtype, weight_dtype, grad_dtype, dynamic
     ):
-        if not self.train_backend._config.fallback_legacy_dispatch:
+        if self.train_backend._config.fallback_legacy_dispatch is False:
             pytest.skip("Pregrad passes will be replaced with joint passes")
         with need_xpu_graph_logs(), skip_xpu_graph_cache(self.train_backend):
             rmsnorm_test_with_loss_and_grad(

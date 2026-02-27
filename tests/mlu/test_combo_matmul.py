@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-
 import xpu_graph
 from xpu_graph.config import OptLevel
 from xpu_graph.test_utils import (

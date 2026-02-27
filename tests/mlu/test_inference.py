@@ -4,22 +4,22 @@ import xpu_graph
 from xpu_graph import OptLevel
 from xpu_graph.test_utils import need_xpu_graph_logs, skip_xpu_graph_cache
 
-from tests.test_models import all_models, compare_inference
-from tests.utils import parametrize_class_env
+from tests.common.test_models import all_models, compare_inference
+
+DISPATCH_ENV_CONFIGS = [
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+]
 
 device = "mlu"
 data_type = torch.float32
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestInference:
-    def setup_class(self):
-        self.infer_backend = xpu_graph.mlu_compiler(is_training=False, opt_level=OptLevel.level2, freeze=False)
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.infer_backend = xpu_graph.mlu_compiler(is_training=False, opt_level=OptLevel.level2, freeze=False)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -30,16 +30,11 @@ class TestInference:
             compare_inference(device, data_type, ReproCls, self.infer_backend)
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestFreezeInference:
-    def setup_class(self):
-        self.freeze_backend = xpu_graph.mlu_compiler(is_training=False, opt_level=OptLevel.level2, freeze=True)
-        # Warning: DO NOT create both freeze and non-freeze in the same test case,
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.freeze_backend = xpu_graph.mlu_compiler(is_training=False, opt_level=OptLevel.level2, freeze=True)
 
     @pytest.mark.parametrize(
         "ReproCls",
@@ -50,15 +45,11 @@ class TestFreezeInference:
             compare_inference(device, data_type, ReproCls, self.freeze_backend)
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestInferenceWithInterceptor:
-    def setup_class(self):
-        self.infer_backend = xpu_graph.mlu_compiler(
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.infer_backend = xpu_graph.mlu_compiler(
             is_training=False, opt_level=OptLevel.level2, freeze=False, enable_interceptor="rtol=1e-6,atol=1e-5"
         )
 
@@ -73,18 +64,13 @@ class TestInferenceWithInterceptor:
             assert "diverges" not in caplog.text
 
 
-@parametrize_class_env(
-    [
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
-        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
-    ],
-)
+@pytest.mark.env_settings(DISPATCH_ENV_CONFIGS)
 class TestFreezeInferenceWithInterceptor:
-    def setup_class(self):
-        self.freeze_backend = xpu_graph.mlu_compiler(
+    @pytest.fixture(autouse=True, scope="class")
+    def setup_xpugraph(self, env_dispatch, request):
+        request.cls.freeze_backend = xpu_graph.mlu_compiler(
             is_training=False, opt_level=OptLevel.level2, freeze=True, enable_interceptor="rtol=1e-6,atol=1e-5"
         )
-        # Warning: DO NOT create both freeze and non-freeze in the same test case,
 
     @pytest.mark.parametrize(
         "ReproCls",
