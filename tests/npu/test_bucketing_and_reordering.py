@@ -29,7 +29,7 @@ TRAIN_CONFIG = TrainConfig(
     loss_fn=torch.nn.CrossEntropyLoss(reduction="mean"),
     is_debug=True,
     device="npu",
-    steps=200,
+    steps=300,
 )
 
 XPU_GRAPH_CONFIG = XpuGraphConfig(
@@ -43,7 +43,7 @@ XPU_GRAPH_CONFIG = XpuGraphConfig(
 )
 
 
-def test_fsdp(path: str = "/tmp/test/fsdp.pt"):
+def run_fsdp(path: str = "/tmp/test/fsdp.pt"):
     logger.info("begin test fsdp")
     set_seed(TRAIN_CONFIG.seed)
     set_dist_env()
@@ -68,14 +68,14 @@ def test_fsdp(path: str = "/tmp/test/fsdp.pt"):
     logger.info("fsdp training finished")
 
 
-def test_fsdp_bucketing_and_reordering():
+def run_fsdp_bucketing_and_reordering():
     logger.info("begin test fsdp bucketing and reordering")
     XPU_GRAPH_CONFIG.bucketing_and_reordering = True
-    test_fsdp("/tmp/test/fsdp_bucketing_and_reordering.pt")
+    run_fsdp("/tmp/test/fsdp_bucketing_and_reordering.pt")
     XPU_GRAPH_CONFIG.bucketing_and_reordering = False
 
 
-def test_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
+def run_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
     logger.info("begin test no-fsdp")
     set_seed(TRAIN_CONFIG.seed)
     mp.set_start_method("spawn", force=True)
@@ -103,7 +103,7 @@ def compare_weight(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-
     if not os.path.exists(path2):
         logger.error(f"path2: {path2} not exists")
         return
-    logger.info(f"begin compare weight, path1: {path1}, path2: {path2}")
+    logger.info(f"begin compare weight, path1: {path1}, path2: {path2}, atol: {atol}, rtol: {rtol}")
     state_dict1 = torch.load(path1, map_location="cpu")
     state_dict2 = torch.load(path2, map_location="cpu")
     assert state_dict1.keys() == state_dict2.keys(), "two state_dict keys are not equal"
@@ -128,14 +128,14 @@ def compare_weight(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-
         logger.info("two state_dict weights are close")
 
 
-def compare_grad_xors(path1: str, path2: str):
+def compare_grad_xors(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-4):
     if not os.path.exists(path1):
         logger.error(f"path1: {path1} not exists")
         return False
     if not os.path.exists(path2):
         logger.error(f"path2: {path2} not exists")
         return False
-    logger.info(f"begin compare grad xors, path1: {path1}, path2: {path2}")
+    logger.info(f"begin compare grad xors, path1: {path1}, path2: {path2}, atol: {atol}, rtol: {rtol}")
     grad_xors1 = torch.load(path1, map_location="cpu")
     grad_xors2 = torch.load(path2, map_location="cpu")
 
@@ -159,7 +159,7 @@ def compare_grad_xors(path1: str, path2: str):
 
         step_equal = True
         for param_name in sorted(params1):
-            if xors1[param_name] != xors2[param_name]:
+            if not torch.allclose(xors1[param_name], xors2[param_name], atol=atol, rtol=rtol):
                 logger.error(
                     f"step {step}, param {param_name}: xor mismatch {xors1[param_name]} vs {xors2[param_name]}"
                 )
@@ -206,27 +206,35 @@ def prepare_test_data():
 @pytest.mark.exclusive
 def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
-    logger.info("begin test bucketing and reordering")
+    logger.info("begin test fsdp with bucketing and reordering vs fsdp without bucketing and reordering")
     prepare_test_data()
-    test_fsdp()
-    test_bucketing_and_reordering()
-    compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/no_fsdp.pt")
+    run_fsdp()
+    run_fsdp_bucketing_and_reordering()
+    compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/no_fsdp.pt", atol=0.0, rtol=0.0)
+    compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", atol=0.0, rtol=0.0)
+
+
+@pytest.mark.exclusive
+def test_fsdp():
+    setup_logger(is_debug=True)
+    logger.info("begin test fsdp with bucketing and reordering vs no-fsdp")
+    prepare_test_data()
+    run_no_fsdp()
+    run_fsdp_bucketing_and_reordering()
+    compare_weight("/tmp/test/no_fsdp.pt", "/tmp/test/fsdp_bucketing_and_reordering.pt", atol=1e-4, rtol=1e-4)
+    compare_grad_xors("/tmp/test/no_fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
     setup_logger(is_debug=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test", "-t", type=str, default="all", choices=["fsdp", "no_fsdp", "all"])
+    parser.add_argument("--test", "-t", type=str, default="bucketing_and_reordering", choices=["fsdp", "bucketing_and_reordering", "compare"])
     args = parser.parse_args()
     prepare_test_data()
-    if args.test == "all":
-        test_no_fsdp()
+    if args.test == "fsdp":
         test_fsdp()
-        compare_weight("/tmp/test/no_fsdp.pt", "/tmp/test/fsdp.pt", atol=0.0, rtol=0.0)
-    elif args.test == "fsdp":
-        test_fsdp()
-        test_fsdp_bucketing_and_reordering()
+    elif args.test == "bucketing_and_reordering":
+        test_bucketing_and_reordering()
+    elif args.test == "compare":
         compare_weight("/tmp/test/fsdp.pt", "/tmp/test/fsdp_bucketing_and_reordering.pt", atol=0.0, rtol=0.0)
-        compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt")
-    elif args.test == "no_fsdp":
-        test_no_fsdp()
+        compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", atol=0.0, rtol=0.0)
