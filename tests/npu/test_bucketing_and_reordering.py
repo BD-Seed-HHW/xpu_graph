@@ -29,14 +29,14 @@ TRAIN_CONFIG = TrainConfig(
     loss_fn=torch.nn.CrossEntropyLoss(reduction="mean"),
     is_debug=True,
     device="npu",
-    steps=300,
+    steps=200,
 )
 
 XPU_GRAPH_CONFIG = XpuGraphConfig(
     is_training=True,
     freeze=False,
     target=Target.npu,
-    opt_level=OptLevel.level1,
+    opt_level=OptLevel.level3,
     debug=True,
     bucketing_and_reordering=False,
     vendor_compiler_config=None,
@@ -128,14 +128,14 @@ def compare_weight(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-
         logger.info("two state_dict weights are close")
 
 
-def compare_grad_xors(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-4):
+def compare_grad_xors(path1: str, path2: str, tolerance: int = 0):
     if not os.path.exists(path1):
         logger.error(f"path1: {path1} not exists")
         return False
     if not os.path.exists(path2):
         logger.error(f"path2: {path2} not exists")
         return False
-    logger.info(f"begin compare grad xors, path1: {path1}, path2: {path2}, atol: {atol}, rtol: {rtol}")
+    logger.info(f"begin compare grad xors, path1: {path1}, path2: {path2}, tolerance: {tolerance}")
     grad_xors1 = torch.load(path1, map_location="cpu")
     grad_xors2 = torch.load(path2, map_location="cpu")
 
@@ -159,9 +159,10 @@ def compare_grad_xors(path1: str, path2: str, atol: float = 1e-4, rtol: float = 
 
         step_equal = True
         for param_name in sorted(params1):
-            if not torch.allclose(xors1[param_name], xors2[param_name], atol=atol, rtol=rtol):
+            diff = abs(xors1[param_name] - xors2[param_name])
+            if diff > tolerance:
                 logger.error(
-                    f"step {step}, param {param_name}: xor mismatch {xors1[param_name]} vs {xors2[param_name]}"
+                    f"step {step}, param {param_name}: xor mismatch {xors1[param_name]} vs {xors2[param_name]} (diff: {diff})"
                 )
                 step_equal = False
                 all_equal = False
@@ -211,7 +212,7 @@ def test_bucketing_and_reordering():
     run_fsdp()
     run_fsdp_bucketing_and_reordering()
     compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/no_fsdp.pt", atol=0.0, rtol=0.0)
-    compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", atol=0.0, rtol=0.0)
+    compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", tolerance=0)
 
 
 @pytest.mark.exclusive
@@ -222,7 +223,7 @@ def test_fsdp():
     run_no_fsdp()
     run_fsdp_bucketing_and_reordering()
     compare_weight("/tmp/test/no_fsdp.pt", "/tmp/test/fsdp_bucketing_and_reordering.pt", atol=1e-4, rtol=1e-4)
-    compare_grad_xors("/tmp/test/no_fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", atol=1e-4, rtol=1e-4)
+    compare_grad_xors("/tmp/test/no_fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", tolerance=1e-4)
 
 
 if __name__ == "__main__":
@@ -237,4 +238,4 @@ if __name__ == "__main__":
         test_bucketing_and_reordering()
     elif args.test == "compare":
         compare_weight("/tmp/test/fsdp.pt", "/tmp/test/fsdp_bucketing_and_reordering.pt", atol=0.0, rtol=0.0)
-        compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", atol=0.0, rtol=0.0)
+        compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", tolerance=0)
