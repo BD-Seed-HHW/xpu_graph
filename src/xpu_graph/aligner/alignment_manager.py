@@ -64,7 +64,7 @@ class AlignmentManager:
         # -- ops.xpugraph.instrument --
         @torch.library.custom_op("xpugraph::instrument", mutates_args=())
         def xpugraph_instrument(x: torch.Tensor, nid: int, stage: int, gid: str, vid: str) -> torch.Tensor:
-            mgr.get_graph(gid).get_node(nid, stage).record(
+            mgr.get_graph(gid).get_node(nid, Stage(stage)).record(
                 vid,
                 self.xorsum32(x),
                 x.detach().cpu()
@@ -78,14 +78,35 @@ class AlignmentManager:
             setup_context=lambda ctx, inputs, output: None
         )
 
+    # @staticmethod
+    # def xorsum32(t: torch.Tensor) -> int:
+    #     """32-bit XOR checksum of the tensor's raw bytes, padded to a multiple of 4 bytes if necessary."""
+    #     b = t.detach().contiguous().cpu().reshape(-1).view(torch.uint8)
+    #     b = F.pad(b, (0, (-b.numel()) % 4))
+    #     w = b.view(-1, 4).to(torch.int64)
+    #     u32 = w[:, 0] | (w[:, 1] << 8) | (w[:, 2] << 16) | (w[:, 3] << 24)
+    #     return int(np.bitwise_xor.reduce(u32.numpy(), dtype=np.uint64)) & 0xFFFFFFFF
+
     @staticmethod
     def xorsum32(t: torch.Tensor) -> int:
-        """32-bit XOR checksum of the tensor's raw bytes, padded to a multiple of 4 bytes if necessary."""
-        b = t.detach().contiguous().cpu().reshape(-1).view(torch.uint8)
-        b = F.pad(b, (0, (-b.numel()) % 4))
-        w = b.view(-1, 4).to(torch.int64)
-        u32 = w[:, 0] | (w[:, 1] << 8) | (w[:, 2] << 16) | (w[:, 3] << 24)
-        return int(np.bitwise_xor.reduce(u32.numpy(), dtype=np.uint64)) & 0xFFFFFFFF
+        t = t.detach()
+        b = t.contiguous().view(torch.uint8).reshape(-1)
+        # Pad to multiple of 4 bytes
+        pad_bytes = (-b.numel()) % 4
+        if pad_bytes > 0:
+            b = F.pad(b, (0, pad_bytes))
+        # View as 32-bit integers
+        # Note: view(int32) uses machine endianness (usually LE), which matches the original manual LE construction on standard platforms.
+        u32 = b.view(torch.int32)
+        # Hierarchical XOR reduction
+        while u32.numel() > 1:
+            if u32.numel() % 2 != 0:
+                u32 = F.pad(u32, (0, 1))
+            u32 = u32.view(-1, 2)
+            u32 = torch.bitwise_xor(u32[:, 0], u32[:, 1])
+        if u32.numel() == 0:
+            return 0
+        return u32.item() & 0xFFFFFFFF
 
     def inject_marker_meta_and_remove_marker_fw_pass(self, agraph_id: str, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         fxgraph: torch.fx.Graph = gm.graph
@@ -180,12 +201,15 @@ class AlignmentManager:
         gold_vid: str = gold_vid if gold_vid is not None else variant_ids[0]
         nodes: list[AlignmentNode] = agraph.nodes
 
-        n_steps = max(len(n.data.get(gold_vid, [])) for n in nodes.values())
+        n_steps = 0 if len(nodes) == 0 else max(len(n.data.get(gold_vid, [])) for n in nodes.values())
         for i in range(n_steps):
-            print(f"\n\n{'='*100}\nStep {i}  —  Graph {agraph.id!r}\n{'='*100}")
+            print(f"\n{'='*100}\nStep {i}  —  Graph {agraph.id!r}\n{'='*100}")
             for node_id, align_node in nodes.items():
                 nmeta, ndata = align_node.meta, align_node.data
-                print(f"\nNode {node_id} - {align_node.stage.name} {nmeta['op']} {nmeta['target']}")
+                print(f"\nNode {node_id} - {align_node.stage.name} {nmeta.get('op', '?')} {nmeta.get('target', '?')}")
+                if i >= len(ndata.get(gold_vid, [])):
+                    print(f"  {gold_vid}: No data")
+                    continue
                 gold_xor, gold_ten = ndata[gold_vid][i][0], ndata[gold_vid][i][1].to(torch.float32)
                 for vid in variant_ids:
                     data = ndata.get(vid, [])
@@ -201,6 +225,7 @@ class AlignmentManager:
                         f"xorsum=0x{var_xor:08X}, max_diff={max_diff:.10f}, "
                         f"closeto={str(closeto):5}"
                     )
+            print()
 
     def export_dot(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None, steps: list[int] = None, fpath: str = "align_graph.dot") -> graphviz.Digraph:
         agraph: AlignmentGraph = self.get_graph(agraph_id)
@@ -402,11 +427,13 @@ class AlignedModelGenerator:
             return functorch.compile.make_boxed_func(gm.forward)
 
         def backend(gm: torch.fx.GraphModule, example_inputs):
+            from torch._functorch.partitioners import min_cut_rematerialization_partition
             gm = aot_module_simplified(
                 gm,
                 example_inputs,
                 fw_compiler=alignment_fw_compiler,
                 bw_compiler=alignment_bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
             )
             # disable dynamo guards to avoid recompile.
             tracing_context = torch._guards.TracingContext.try_get()
@@ -415,15 +442,18 @@ class AlignedModelGenerator:
 
         return backend
 
-    def get_compiled(self, model: nn.Module, example_inputs: tuple) -> nn.Module:
+    def get_compiled(self, model: nn.Module, args: tuple, kwargs: dict) -> nn.Module:
         """Return a compiled, instrumented model."""
         if self._generated:
             raise RuntimeError("An AlignedModelGenerator instance can only generate once. Create a new one for another generation.")
 
         with self._marker_inject_mode:
             compiled_fn = torch.compile(model, backend=self._make_backend(), dynamic=True, fullgraph=True)
-            _ = compiled_fn(*example_inputs)
-            _.backward(torch.ones_like(_))
+            out = compiled_fn(*args, **kwargs)
+            flat_out, _ = torch.utils._pytree.tree_flatten(out)
+            tensors_req = [v for v in flat_out if isinstance(v, torch.Tensor) and v.requires_grad]
+            for t in tensors_req:
+                t.backward(torch.ones_like(t))
         self._marker_inject_mode._disabled = True
         # clear recorded data during warmup
         self._mgr.get_graph(self._agraph_id).clear_data()

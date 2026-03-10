@@ -4,3 +4,7 @@ build
 dist
 fusion_result.json
 kernel_meta/
+
+# aligner
+*.log
+*.dot
