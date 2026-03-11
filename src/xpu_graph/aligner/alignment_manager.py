@@ -1,17 +1,16 @@
-from typing import Optional
-import numpy as np
 import json as _json
-import graphviz
+from typing import Optional
 
+import functorch
+import graphviz
 import torch
+import torch._dynamo as dynamo
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.overrides import TorchFunctionMode
 from torch._functorch.aot_autograd import aot_module_simplified
-import torch._dynamo as dynamo
-import functorch
+from torch.overrides import TorchFunctionMode
 
-from .alignment_graph import AlignmentNode, AlignmentGraph, GraphMapping, Stage
+from .alignment_graph import AlignmentGraph, AlignmentNode, GraphMapping, Stage
 
 
 class AlignmentManager:
@@ -210,7 +209,7 @@ class AlignmentManager:
                 if i >= len(ndata.get(gold_vid, [])):
                     print(f"  {gold_vid}: No data")
                     continue
-                gold_xor, gold_ten = ndata[gold_vid][i][0], ndata[gold_vid][i][1].to(torch.float32)
+                _, gold_ten = ndata[gold_vid][i][0], ndata[gold_vid][i][1].to(torch.float32)
                 for vid in variant_ids:
                     data = ndata.get(vid, [])
                     if not data or i >= len(data):
@@ -248,8 +247,9 @@ class AlignmentManager:
                     if not data or s >= len(data):
                         entry["status"] = "no data"
                     else:
-                        xorsum, raw_32 = data[s][0], data[s][1].to(torch.float32)
-                        entry["dtype"] = str(raw_32.dtype).replace("torch.", "")
+                        xorsum, raw = data[s][0], data[s][1]
+                        raw_32 = raw.to(torch.float32)
+                        entry["dtype"] = str(raw.dtype).replace("torch.", "")
                         entry["xorsum"] = f"0x{xorsum:08X}"
                         if gold_data and s < len(gold_data):
                             g32 = gold_data[s][1].to(torch.float32)
@@ -348,7 +348,7 @@ class AlignedModelGenerator:
                 items = [self._inject_markers(item) for item in result]
                 return type(result)(items)
             return result
-        
+
         def _new_node_id(self) -> int:
             ret = self._next_node_id
             self._next_node_id += 1
@@ -392,7 +392,7 @@ class AlignedModelGenerator:
             elif isinstance(result, (tuple, list)) and all(isinstance(item, torch.Tensor) for item in result):
                 for item in result:
                     self._instrument(item)
-        
+
         def reset_id_counter(self):
             self._next_node_id = 0
 
@@ -457,6 +457,9 @@ class AlignedModelGenerator:
         self._marker_inject_mode._disabled = True
         # clear recorded data during warmup
         self._mgr.get_graph(self._agraph_id).clear_data()
+        # clear grad
+        for p in model.parameters():
+            p.grad = None
 
         wrapper_marker_mode = self._marker_inject_mode  # prevent closure over self
         class _WrapModuleCompile(nn.Module):
