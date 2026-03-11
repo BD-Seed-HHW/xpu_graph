@@ -21,16 +21,19 @@ class PassManager:
         self._pattern_manager = PatternManager(self._config)
 
         if self._config.bucketing_and_reordering:
-            from .bucketing_and_reordering import BucketingAndReordering
+            from .bucketing import Bucketing
+            from .reordering import Reordering
             from .reshard_after_forward import ReshardAfterForward
 
             if ReshardAfterForward._opt_level <= self._config.opt_level:
                 self._passes.append(ReshardAfterForward())
 
-            if BucketingAndReordering._opt_level <= self._config.opt_level:
+            if Bucketing._opt_level <= self._config.opt_level:
                 assert "module_bucket_plans" in kwargs, "module_bucket_plans must be provided when bucketing_and_reordering is enabled"
                 module_bucket_plans = kwargs.get("module_bucket_plans")
-                self._passes.append(BucketingAndReordering(module_bucket_plans=module_bucket_plans))
+                self._passes.append(Bucketing(module_bucket_plans=module_bucket_plans))
+            if Reordering._opt_level <= self._config.opt_level:
+                self._passes.append(Reordering())
 
         from .remove_runtime_assertions import RemoveAssertions
 

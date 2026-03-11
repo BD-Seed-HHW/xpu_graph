@@ -14,6 +14,13 @@ from torch.distributed._tensor import (
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    PrepareModuleInput,
+    RowwiseParallel,
+    SequenceParallel,
+    parallelize_module,
+)
 from torch.distributed.tensor.placement_types import Placement, _StridedShard
 from xpu_graph.utils import logger
 
@@ -357,6 +364,73 @@ def apply_fsdp(
 
 def apply_tp(
     model: nn.Module,
-    device_mesh: DeviceMesh
-) -> nn.Module:
+    tp_mesh: DeviceMesh,
+    loss_parallel: bool,
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "model.model.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "model.model.norm": SequenceParallel(),
+            "model.lm_head": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1) if loss_parallel else Replicate(),
+                use_local_output=not loss_parallel,
+            ),
+        },
+    )
+
+    rowwise_parallel, colwise_parallel, prepare_module_input = (
+        RowwiseParallel,
+        ColwiseParallel,
+        PrepareModuleInput,
+    )
+
+    # Apply tensor + sequence parallelism to every transformer block
+    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
+    #       by folding (and unfolding) the batch dimension and the sequence dimension.
+    #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
+    # pyrefly: ignore [not-callable]
+    for transformer_block in model.model.layers.values():
+        layer_plan = {
+            "": SequenceParallel(),
+            # NOTE: when the fourth argument (positions) is not None, its input layout
+            # and desired input layout is still None as we don't convert freqs_cis to
+            # a DTensor for llama3.
+            # TODO: https://github.com/pytorch/torchtitan/pull/2149 would fix this
+            # inconsistency.
+            "self_attn": prepare_module_input(
+                input_layouts=(Shard(1), None, None),
+                desired_input_layouts=(Replicate(), None, None),
+            ),
+            "self_attn.q_proj": colwise_parallel(),
+            "self_attn.k_proj": colwise_parallel(),
+            "self_attn.v_proj": colwise_parallel(),
+            "self_attn.o_proj": rowwise_parallel(output_layouts=Shard(1)),
+            "ffn_norm": SequenceParallel(),
+            "mlp": prepare_module_input(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+            "mlp.gate_proj": colwise_parallel(),
+            "mlp.up_proj": colwise_parallel(),
+            "mlp.down_proj": rowwise_parallel(output_layouts=Shard(1)),
+        }
+
+        parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            # pyrefly: ignore [bad-argument-type]
+            parallelize_plan=layer_plan,
+        )
     logger.info(f"Apply TP to {model.__class__.__name__}")

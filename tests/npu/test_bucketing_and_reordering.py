@@ -36,7 +36,7 @@ XPU_GRAPH_CONFIG = XpuGraphConfig(
     is_training=True,
     freeze=False,
     target=Target.npu,
-    opt_level=OptLevel.level3,
+    opt_level=OptLevel.level1,
     debug=True,
     bucketing_and_reordering=False,
     vendor_compiler_config=None,
@@ -63,7 +63,7 @@ def run_fsdp(path: str = "/tmp/test/fsdp.pt"):
     train_config.is_compile = True
     mp.spawn(
         train,
-        args=(train_config, path),
+        args=(train_config, path, XPU_GRAPH_CONFIG),
         nprocs=world_size_)
     logger.info("fsdp training finished")
 
@@ -79,6 +79,7 @@ def run_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
     logger.info("begin test no-fsdp")
     set_seed(TRAIN_CONFIG.seed)
     mp.set_start_method("spawn", force=True)
+    TRAIN_CONFIG.is_compile = True
     train_config = TRAIN_CONFIG
     train_config.parallelize_dims = ParallelizeDims(
         dp_replicate=1,
@@ -91,9 +92,10 @@ def run_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
     )
     mp.spawn(
         train,
-        args=(train_config, path),
+        args=(train_config, path, XPU_GRAPH_CONFIG),
         nprocs=1)
     logger.info("no-fsdp training finished")
+    TRAIN_CONFIG.is_compile = False
 
 
 def compare_weight(path1: str, path2: str, atol: float = 1e-4, rtol: float = 1e-4):
@@ -209,9 +211,9 @@ def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
     logger.info("begin test fsdp with bucketing and reordering vs fsdp without bucketing and reordering")
     prepare_test_data()
-    run_fsdp()
     run_fsdp_bucketing_and_reordering()
-    compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/no_fsdp.pt", atol=0.0, rtol=0.0)
+    run_fsdp()
+    compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/fsdp.pt", atol=0.0, rtol=0.0)
     compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", tolerance=0)
 
 

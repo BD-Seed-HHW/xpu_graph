@@ -1,3 +1,4 @@
+import datetime
 import os
 from dataclasses import dataclass
 from functools import reduce
@@ -9,6 +10,7 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from xpu_graph.compiler import XpuGraph
+from xpu_graph.config import XpuGraphConfig
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import cleanup, dist_setup
@@ -18,7 +20,9 @@ from .parallel_dims import ParallelizeDims
 
 
 def compute_tensor_xor(tensor: torch.Tensor) -> int:
-    int8_data = tensor.detach().cpu().view(torch.int8).flatten().to_local()
+    int8_data = tensor.detach().cpu().view(torch.int8).flatten()
+    if isinstance(int8_data, torch.distributed._tensor.DTensor):
+        int8_data = int8_data.to_local()
     xor_result = reduce(lambda x, y: x ^ y, int8_data.tolist(), 0)
     return xor_result
 
@@ -116,12 +120,11 @@ def get_transformer_block_buckets(model: Qwen3ForCausalLM) -> list[list[str] | s
     return module_fqns
 
 
-def compile_model(model: Qwen3ForCausalLM):
-    from ..test_bucketing_and_reordering import XPU_GRAPH_CONFIG
+def compile_model(model: Qwen3ForCausalLM, xpu_graph_config: XpuGraphConfig):
     module_bucket_plans = get_transformer_block_buckets(model)
     logger.info(f"module_bucket_plans: {module_bucket_plans}")
     xpu_graph_backend = XpuGraph(
-        XPU_GRAPH_CONFIG,
+        xpu_graph_config,
         module_bucket_plans=module_bucket_plans,
     )
     model = torch.compile(model, backend=xpu_graph_backend)
@@ -131,6 +134,9 @@ def compile_model(model: Qwen3ForCausalLM):
 
 def forward_backward_step(model, optimizer, loss_fn, data, target, rank):
     optimizer.zero_grad()
+    time0 = datetime.datetime.now()
+    event0 = torch.npu.Event(enable_timing=True)
+    event0.record()
     logits = model(data)
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = target[:, 1:].contiguous()
@@ -143,14 +149,23 @@ def forward_backward_step(model, optimizer, loss_fn, data, target, rank):
 
     loss.backward()
 
+    event1 = torch.npu.Event(enable_timing=True)
+    event1.record()
+    time1 = datetime.datetime.now()
+    torch.npu.synchronize()
+    time2 = datetime.datetime.now()
+    host_time_step = (time1 - time0).total_seconds()
+    npu_time_step = event0.elapsed_time(event1) / 1000.0
+    e2e_time_step = (time2 - time0).total_seconds()
+
     grad_xors = compute_grad_xors(model)
 
     optimizer.step()
 
-    return loss.detach(), grad_xors
+    return loss.detach(), grad_xors, host_time_step, npu_time_step, e2e_time_step
 
 
-def train(rank, train_config, path):
+def train(rank, train_config, path, xpu_graph_config):
     setup_logger(is_debug=True)
     rank = rank
     model = Qwen3ForCausalLM(train_config.model_config)
@@ -158,8 +173,8 @@ def train(rank, train_config, path):
     if train_config.parallelize_dims.world_size > 1:
         dist_setup(rank, train_config.parallelize_dims.world_size)
         train_config.parallelize_fn(model, train_config.parallelize_dims)
-        if train_config.is_compile:
-            model = compile_model(model)
+    if train_config.is_compile:
+        model = compile_model(model, xpu_graph_config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
     loss_fn = train_config.loss_fn
     mini_batch_size = train_config.batch_size // dist.get_world_size() if dist.is_initialized() else train_config.batch_size
@@ -173,6 +188,7 @@ def train(rank, train_config, path):
     global_step = 0
 
     all_grad_xors = {}
+    host_time, npu_time, e2e_time = 0.0, 0.0, 0.0
 
     for epoch in range(train_config.epochs):
         total_loss = 0.0
@@ -182,10 +198,16 @@ def train(rank, train_config, path):
         for batch_idx, (data, target) in enumerate(data_loader):
             global_step += 1
             data, target = data.to(train_config.device), target.to(train_config.device)
-            loss, grad_xors = forward_backward_step(model, optimizer, loss_fn, data, target, rank)
+
+            loss, grad_xors, host_time_step, npu_time_step, e2e_time_step = \
+                forward_backward_step(model, optimizer, loss_fn, data, target, rank)
+            host_time += host_time_step
+            e2e_time += e2e_time_step
+            npu_time += npu_time_step
             all_grad_xors[global_step] = grad_xors
             total_loss += loss
-            logger.info(f"rank[{rank}]: Epoch [{epoch}], Step [{global_step}], Loss: {loss:.4f}")
+            logger.info(f"rank[{rank}]: Epoch [{epoch}], Step [{global_step}], Loss: {loss:.4f}, "
+                        f"Host time: {host_time_step:.4f}, NPU time: {npu_time_step:.4f}, E2E time: {e2e_time_step:.4f}")
             n_batch += 1
             if global_step >= train_config.steps:
                 break
@@ -196,6 +218,10 @@ def train(rank, train_config, path):
         logger.info(f"rank[{rank}]: Epoch [{epoch}], Loss: {total_loss:.4f}")
         if global_step >= train_config.steps:
             break
+
+    logger.info(f"rank[{rank}]: Host time: {host_time / global_step:.4f}/step")
+    logger.info(f"rank[{rank}]: NPU time: {npu_time / global_step:.4f}/step")
+    logger.info(f"rank[{rank}]: E2E time: {e2e_time / global_step:.4f}/step")
 
     folder = os.path.dirname(path)
     filename = os.path.basename(path)

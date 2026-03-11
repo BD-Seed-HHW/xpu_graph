@@ -1,13 +1,11 @@
-import heapq
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable
 
 import torch
 import torch.fx as fx
-from torch.fx import Node, map_arg
 from torch.utils._ordered_set import OrderedSet
 
 from xpu_graph.fx_utils import FxStage
@@ -16,6 +14,7 @@ from xpu_graph.passes.optimizer import Optimizer
 from .bucketing_utils import bucket_key, is_wait_tensor, merge_all_gather_bucket, merge_reduce_scatter_bucket
 from .bucketing_utils import is_all_gather_into_tensor as is_all_gather
 from .bucketing_utils import is_reduce_scatter_tensor as is_reduce_scatter
+from .reordering import _stable_topological_sort
 
 #  adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/overlap_manual_scheduling.py
 
@@ -53,71 +52,6 @@ def _schedulable_wait_node(node: torch.fx.Node) -> bool:
         coll = COLL.UNSUPPORTED
     is_collective: bool = coll != COLL.UNSUPPORTED
     return is_callable and is_collective
-
-
-def _get_flat_args_unique(
-    node: Node, node_to_additional_deps: dict[Node, OrderedSet[Node]]
-) -> OrderedSet[Node]:
-    args = OrderedSet[Node]()
-    map_arg((node.args, node.kwargs), args.add)
-    if node in node_to_additional_deps:
-        args.update(node_to_additional_deps[node])
-    return args
-
-
-def _stable_topological_sort(
-    graph: torch.fx.Graph,
-    node_to_additional_deps: dict[Node, OrderedSet[Node]],
-    do_sort: bool = True,
-) -> bool:
-    # Nodes are in exactly one of these four collections:
-
-    # - Nodes in `pending` are waiting to be processed (in reverse order):
-    pending = list(reversed(graph.nodes))
-
-    # - Nodes in `ready` have been processed and are already in the correct
-    #   order.
-    ready = OrderedSet[Node]()
-
-    # - `waiting` is a mapping from a dependency to nodes which depend on that
-    #   dependency.
-    waiting = defaultdict(list)
-
-    # - `outputs` are always at the end of the graph
-    outputs = OrderedSet[Node]()
-
-    # The cursor indicates the last processed node so we can add new nodes
-    # after it.
-    cursor = None
-    while pending:
-        node = pending.pop()
-
-        if node.target == "output":
-            outputs.add(node)
-            assert not node.users, "output nodes should have no users"
-            continue
-
-        waiting_for = [
-            x
-            for x in _get_flat_args_unique(node, node_to_additional_deps)
-            if x not in ready
-        ]
-        # print(f"node: {node}, waiting_for: {waiting_for}")
-        if waiting_for:
-            # We have unprocessed input nodes. Might as well wait for the last
-            # arg so an already sorted list will only recheck this node once.
-            waiting[waiting_for[-1]].append(node)
-        else:
-            ready.add(node)
-            if cursor and cursor.next is not node and do_sort:
-                cursor.append(node)
-            cursor = node
-            # Mark the nodes that have been waiting for this node to finish as
-            # ready to check again.
-            pending.extend(reversed(waiting.pop(node, ())))
-
-    ready.update(outputs)
-    return not waiting and len(ready) == len(graph.nodes)
 
 
 class ManualBucketer:
@@ -209,12 +143,6 @@ class ManualBucketer:
             raise ValueError(
                 "bucket non all_gather/reduce_scatter node is not supported"
             )
-        new_waits = [n for n in new_nodes if _schedulable_wait_node(n)]
-        assert len(new_waits) == 1, f"Expected exactly one new wait, got {new_waits}"
-        new_wait = new_waits[0]
-        for n in new_nodes:
-            if "wait" in n.meta.get("manual_bucket_node_type", ""):
-                self.wait_to_node_map[n] = new_wait
 
     def manual_bucket_collectives(self, nodes: list[fx.Node]) -> None:
         """
@@ -246,11 +174,10 @@ class ManualBucketer:
             self._bucket_group(list(nodes))
 
 
-class BucketingAndReordering(Optimizer):
+class Bucketing(Optimizer):
 
     _support_stages = [
         FxStage.inference,
-        FxStage.pregrad,
         FxStage.forward,
         FxStage.backward,
     ]
@@ -258,9 +185,10 @@ class BucketingAndReordering(Optimizer):
     def __init__(self, module_bucket_plans: list[list[str] | str]):
         self.module_bucket_plans = module_bucket_plans
 
-
     def process(self, gm: fx.GraphModule):
         gm.graph.lint()
+        if torch.distributed.get_rank() == 0:
+            print(f"before bucket collectives, graph :\n{gm.print_readable()}")
         for node in gm.graph.nodes:
             if node.op == "call_function" and (node.target == torch.ops.bucketing._pre_bucket_all_gather or node.target == torch.ops.bucketing._pre_bucket_reduce_scatter):
                 return False
@@ -277,8 +205,8 @@ class BucketingAndReordering(Optimizer):
         )
 
         self._manual_bucket_collectives()
-        self._manual_reorder_graph()
-
+        if torch.distributed.get_rank() == 0:
+            print(f"after bucket collectives, graph :\n{gm.print_readable()}")
         return True
 
     def _identify_collectives(self) -> None:
@@ -292,80 +220,12 @@ class BucketingAndReordering(Optimizer):
                 )
                 self.collective_info[start] = info
 
-    def _schedule(self, node: fx.Node) -> None:
-        assert node not in self.scheduled
-        assert all(n in self.scheduled for n in node.all_input_nodes)
-        self.scheduled.add(node)
-        for user in node.users:
-            self.in_degree[user] -= 1
-            if self.in_degree[user] == 0:
-                heapq.heappush(self.ready, (self.node_idx[user], user))
-
-    def _manual_reorder_graph(self) -> None:
-        """
-        Reorder the graph manually based on the bucketed collectives.
-        """
-        delayed_rs_nodes: list[fx.Node] = []
-        overlap_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
-        self.node_idx = {n: i for i, n in enumerate(self.graph.nodes)}
-        self.scheduled = OrderedSet()
-        self.ready: list[tuple[int, fx.Node]] = []
-
-        for node in self.graph.nodes:
-            if self.in_degree[node] == 0:
-                heapq.heappush(self.ready, (self.node_idx[node], node))
-        # schedule reduce scatter normally in self._schedule
-        while self.ready:
-            _, node = heapq.heappop(self.ready)
-            node_type = node.meta.get("manual_bucket_node_type", "")
-
-            if node in self.scheduled:
-                continue
-
-            if node_type == "bucketed_reduce_scatter":
-                # Ensure all delayed waits execute before this reduce_scatter
-                for delayed in delayed_rs_nodes:
-                    self._schedule(delayed)
-                    overlap_deps[delayed].add(node)
-                delayed_rs_nodes.clear()
-
-            elif node_type == "bucketed_reduce_scatter_wait":
-                # Defer until next reduce_scatter
-                delayed_rs_nodes.append(node)
-                continue
-            self._schedule(node)
-
-        for delayed in delayed_rs_nodes:
-            self._schedule(delayed)
-
-        self.scheduled = OrderedSet(reversed(list(self.scheduled)))
-        picked_ag: list[fx.Node] = []
-
-        for node in self.scheduled:
-            node_type = node.meta.get("manual_bucket_node_type", "")
-            if node_type == "bucketed_all_gather":
-                picked_ag.append(node)
-                continue
-
-            if node_type == "bucketed_all_gather_wait":
-                if picked_ag:
-                    reversed_picked_ag = list(reversed(picked_ag))
-                    for ag in reversed_picked_ag:
-                        overlap_deps[self.bucketer.wait_to_node_map[node]].add(ag)
-                picked_ag.clear()
-
-        _stable_topological_sort(self.graph, overlap_deps)
-        self.graph.lint()
-
     def _manual_bucket_collectives(self) -> None:
         self._get_nodes_in_plans()
         for i, nodes in enumerate(self.nodes_in_plans):
             self.bucketer.manual_bucket_collectives(nodes=nodes)
-
         _stable_topological_sort(self.graph, {})
         self.graph.lint()
-        self.nodes = list(self.graph.nodes)
-        self.in_degree = Counter(user for node in self.graph.nodes for user in node.users)
 
     def _get_nodes_in_plans(self)->None:
         nodes = self.graph.nodes
