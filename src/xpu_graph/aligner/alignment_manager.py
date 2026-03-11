@@ -50,7 +50,7 @@ class AlignmentManager:
             return x.clone()
         @xpugraph_marker.register_fake
         def xpugraph_marker_fake(x: torch.Tensor, nid: int) -> torch.Tensor:
-            return x.clone()
+            return torch.empty_like(x)
         def xpugraph_marker_setup_context(ctx, inputs, output):
             ctx.fw_nid = inputs[1]
         def xpugraph_marker_backward(ctx, grad_output):
