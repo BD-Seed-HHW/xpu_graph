@@ -1,8 +1,6 @@
-import json as _json
 from typing import Optional
 
 import functorch
-import graphviz
 import torch
 import torch._dynamo as dynamo
 import torch.nn as nn
@@ -11,7 +9,8 @@ from torch._functorch.aot_autograd import aot_module_simplified
 from torch.overrides import TorchFunctionMode
 import torch.utils._pytree as pytree
 
-from .alignment_graph import AlignmentGraph, AlignmentNode, GraphMapping, Stage
+from .alignment_graph import AlignmentGraph, GraphMapping, OpInfo, Stage
+from .visualize import AlignmentVisualizer
 
 
 class AlignmentManager:
@@ -38,10 +37,10 @@ class AlignmentManager:
     def mappings(self) -> list[GraphMapping]:
         return list(self._mappings)
 
-    def get_graph(self, id: str) -> AlignmentGraph:
-        if id not in self._graphs:
-            self._graphs[id] = AlignmentGraph(id)
-        return self._graphs[id]
+    def get_graph(self, gid: str) -> AlignmentGraph:
+        if gid not in self._graphs:
+            self._graphs[gid] = AlignmentGraph(gid)
+        return self._graphs[gid]
 
     def _register_ops(self):
         mgr = self
@@ -64,7 +63,7 @@ class AlignmentManager:
         # -- ops.xpugraph.instrument --
         @torch.library.custom_op("xpugraph::instrument", mutates_args=())
         def xpugraph_instrument(x: torch.Tensor, nid: int, stage: int, gid: str, vid: str) -> torch.Tensor:
-            mgr.get_graph(gid).get_node(nid, Stage(stage)).record(
+            mgr.get_graph(gid).get_node(nid, Stage(stage)).record_data(
                 vid,
                 self.xorsum32(x),
                 x.detach().cpu()
@@ -91,14 +90,12 @@ class AlignmentManager:
     def xorsum32(t: torch.Tensor) -> int:
         t = t.detach()
         b = t.contiguous().view(torch.uint8).reshape(-1)
-        # Pad to multiple of 4 bytes
         pad_bytes = (-b.numel()) % 4
         if pad_bytes > 0:
             b = F.pad(b, (0, pad_bytes))
         # View as 32-bit integers
         # Note: view(int32) uses machine endianness (usually LE), which matches the original manual LE construction on standard platforms.
         u32 = b.view(torch.int32)
-        # Hierarchical XOR reduction
         while u32.numel() > 1:
             if u32.numel() % 2 != 0:
                 u32 = F.pad(u32, (0, 1))
@@ -108,7 +105,33 @@ class AlignmentManager:
             return 0
         return u32.item() & 0xFFFFFFFF
 
-    def inject_marker_meta_and_remove_marker_fw_pass(self, agraph_id: str, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    def _find_last_non_trivial_op(self, fxnode: torch.fx.Node) -> OpInfo | None:
+        trivial_target_suffixes = (
+            "view",
+            "reshape",
+            "_unsafe_view",
+            "to",
+            "type_as",
+            "contiguous",
+            "clone",
+            "_to_copy",
+            "cpu",
+            "float",
+            "double",
+            "half",
+            "bfloat16",
+        )
+        source_op = OpInfo.from_fx_node(fxnode)
+        if not any(source_op.target.endswith(suffix) for suffix in trivial_target_suffixes):
+            return source_op
+
+        for input_node in fxnode.all_input_nodes:
+            candidate = self._find_last_non_trivial_op(input_node)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def inject_marker_meta_and_remove_marker_fw_pass(self, agraph_id: str, variant_id: str, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         fxgraph: torch.fx.Graph = gm.graph
         agraph: AlignmentGraph = self.get_graph(agraph_id)
         markers_to_remove = []
@@ -117,12 +140,16 @@ class AlignmentManager:
             if fxnode.op == "call_function" and fxnode.target == torch.ops.xpugraph.marker.default:
                 source_node: torch.fx.Node = fxnode.args[0]
                 nid: int = fxnode.args[1]
-                agraph.get_node(nid, Stage.FORWARD).meta.update({
-                    "op": source_node.op,
-                    "name": source_node.name,
-                    "target": source_node.target,
-                })
-                source_node.meta.setdefault("align_node_ids", []).append(nid)
+                align_node_ids = source_node.meta.setdefault("align_node_ids", [])
+                if not align_node_ids:
+                    align_node_ids.append(nid)
+                    agraph.get_node(nid, Stage.FORWARD).set_meta("op_meta", variant_id,{
+                            "last_op": OpInfo.from_fx_node(source_node),
+                            "last_non_trivial_op": self._find_last_non_trivial_op(source_node),
+                    })
+                else:
+                    source_node.meta.setdefault("collapsed_align_node_ids", []).append(nid)
+                    agraph.mark_collapsed_fw_node(variant_id, nid)
                 fxnode.replace_all_uses_with(source_node)
                 markers_to_remove.append(fxnode)
 
@@ -133,7 +160,7 @@ class AlignmentManager:
         gm.recompile()
         return gm
 
-    def inject_marker_meta_and_remove_marker_bw_pass(self, agraph_id: str, bw_nid_offs: int, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    def inject_marker_meta_and_remove_marker_bw_pass(self, agraph_id: str, variant_id: str, bw_nid_offs: int, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         fxgraph: torch.fx.Graph = gm.graph
         agraph: AlignmentGraph = self.get_graph(agraph_id)
         markers_to_remove = []
@@ -143,13 +170,17 @@ class AlignmentManager:
                 source_node: torch.fx.Node = fxnode.args[0]
                 fw_nid: int = fxnode.args[1]
                 nid = fw_nid + bw_nid_offs  # bw align nid typically is offset from fw nid by total number of fw markers.
-                agraph.add_grad_link(fw_nid, nid)
-                agraph.get_node(nid, Stage.BACKWARD).meta.update({
-                    "op": source_node.op,
-                    "name": source_node.name,
-                    "target": source_node.target,
-                })
+                if agraph.is_fw_node_collapsed(variant_id, fw_nid):
+                    source_node.meta.setdefault("collapsed_align_node_ids", []).append(nid)
+                    fxnode.replace_all_uses_with(source_node)
+                    markers_to_remove.append(fxnode)
+                    continue
                 source_node.meta.setdefault("align_node_ids", []).append(nid)
+                agraph.add_grad_link(fw_nid, nid)
+                agraph.get_node(nid, Stage.BACKWARD).set_meta("op_meta", variant_id, {
+                        "last_op": OpInfo.from_fx_node(source_node),
+                        "last_non_trivial_op": self._find_last_non_trivial_op(source_node),
+                })
                 fxnode.replace_all_uses_with(source_node)
                 markers_to_remove.append(fxnode)
 
@@ -176,37 +207,48 @@ class AlignmentManager:
         gm.recompile()
         return gm
 
-    def build_topology_from_fxgraph(self, agraph_id: str, fxgraph: torch.fx.Graph):
-        """Build topology edges via dataflow coloring on a topologically-ordered ``fx.Graph``."""
+    def build_topology_from_fxgraph(self, agraph_id: str, variant_id: str, fxgraph: torch.fx.Graph):
+        """Build variant-aware topology edges from a topologically-ordered ``fx.Graph``."""
         agraph: AlignmentGraph = self.get_graph(agraph_id)
-        reaching: dict[torch.fx.Node, set[int]] = {}
+        reaching: dict[torch.fx.Node, dict[int, set[tuple[OpInfo, ...]]]] = {}
 
-        for node in fxgraph.nodes:
-            incoming: set[int] = set()
-            for inp in node.all_input_nodes:
-                incoming |= reaching.get(inp, set())
+        def _append_current_op_to_paths(fxnode: torch.fx.Node, paths: dict[int, set[tuple[OpInfo, ...]]]) -> dict[int, set[tuple[OpInfo, ...]]]:
+            if not paths:
+                return {}
+            opinfo = OpInfo.from_fx_node(fxnode)
+            return {src_id: {path + (opinfo,) for path in path_set} for src_id, path_set in paths.items()}
 
-            own_ids = set(node.meta.get("align_node_ids", []))
+        for fxnode in fxgraph.nodes:
+            incoming: dict[int, set[tuple[OpInfo, ...]]] = {}
+            for input_node in fxnode.all_input_nodes:
+                for src_id, path_set in reaching.get(input_node, {}).items():
+                    incoming.setdefault(src_id, set()).update(path_set)
+
+            with_current = _append_current_op_to_paths(fxnode, incoming)
+            own_ids = tuple(dict.fromkeys(fxnode.meta.get("align_node_ids", [])))
             if own_ids:
-                for s in incoming:
-                    for d in own_ids:
-                        if s != d:
-                            agraph.add_edge(s, d)
-                reaching[node] = own_ids
+                for src_id, path_set in with_current.items():
+                    for dst_id in own_ids:
+                        if src_id == dst_id:
+                            continue
+                        for path in path_set:
+                            agraph.add_edge(variant_id, src_id, dst_id, path)
+                reaching[fxnode] = {dst_id: {()} for dst_id in own_ids}
             else:
-                reaching[node] = incoming
+                reaching[fxnode] = with_current
 
     def print_data(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None) -> None:
         agraph: AlignmentGraph = self.get_graph(agraph_id)
-        gold_vid: str = gold_vid if gold_vid is not None else variant_ids[0]
-        nodes: list[AlignmentNode] = agraph.nodes
+        gold_vid = gold_vid if gold_vid is not None else variant_ids[0]
 
-        n_steps = 0 if len(nodes) == 0 else max(len(n.data.get(gold_vid, [])) for n in nodes.values())
+        n_steps = 0 if len(agraph.nodes) == 0 else max(len(n.data.get(gold_vid, [])) for n in agraph.nodes.values())
         for i in range(n_steps):
-            print(f"\n{'='*100}\nStep {i}  —  Graph {agraph.id!r}\n{'='*100}")
-            for node_id, align_node in nodes.items():
-                nmeta, ndata = align_node.meta, align_node.data
-                print(f"\nNode {node_id} - {align_node.stage.name} {nmeta.get('op', '?')} {nmeta.get('target', '?')}")
+            print(f"\n{'='*100}\nStep {i}  -  Graph {agraph.id!r}\n{'='*100}")
+            for node_id, align_node in agraph.nodes.items():
+                ndata = align_node.data
+                op_desc = align_node.get_meta("op_meta", gold_vid, {}).get("last_op")
+                op_text = op_desc.target if isinstance(op_desc, OpInfo) else "?"
+                print(f"\nNode {node_id} - {align_node.stage.name} {op_text}")
                 if i >= len(ndata.get(gold_vid, [])):
                     print(f"  {gold_vid}: No data")
                     continue
@@ -227,107 +269,12 @@ class AlignmentManager:
                     )
             print()
 
-    def export_dot(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None, steps: list[int] = None, fpath: str = "align_graph.dot") -> graphviz.Digraph:
-        agraph: AlignmentGraph = self.get_graph(agraph_id)
-        gold_vid: str = gold_vid if gold_vid is not None else variant_ids[0]
-        steps: list[int] = steps if steps is not None else [0]
-        fw_nodes: dict[str, AlignmentNode] = {nid: n for nid, n in agraph.nodes.items() if n.stage == Stage.FORWARD}
-        bw_nodes: dict[str, AlignmentNode] = {nid: n for nid, n in agraph.nodes.items() if n.stage == Stage.BACKWARD}
-
-        def _build_node_attrs(node_id: int, align_node: AlignmentNode) -> dict[str, str]:
-            op_name = str(align_node.meta.get("target", "?"))
-            label = f"{node_id}: {op_name}"
-
-            gold_data = align_node.data.get(gold_vid, [])
-            all_step_details: list[dict] = []
-            for s in steps:
-                step_variants: list[dict] = []
-                for vid in variant_ids:
-                    entry: dict = {"variant": vid}
-                    data = align_node.data.get(vid, [])
-                    if not data or s >= len(data):
-                        entry["status"] = "no data"
-                    else:
-                        xorsum, raw = data[s][0], data[s][1]
-                        raw_32 = raw.to(torch.float32)
-                        entry["dtype"] = str(raw.dtype).replace("torch.", "")
-                        entry["xorsum"] = f"0x{xorsum:08X}"
-                        if gold_data and s < len(gold_data):
-                            g32 = gold_data[s][1].to(torch.float32)
-                            r32 = raw_32.to(torch.float32)
-                            entry["max_diff"] = float(f"{(r32 - g32).abs().max().item():.8f}")
-                            entry["closeto"] = bool(torch.allclose(r32, g32, rtol=1e-3, atol=1e-5))
-                    step_variants.append(entry)
-                all_step_details.append({"step": s, "variants": step_variants})
-
-            nbsp = "\u00A0"
-            tip_lines = [f"{'-'*80}\nNode {node_id} - {op_name}\n{'-'*80}"]
-            for group in all_step_details:
-                tip_lines.append(f"Step {group['step']}:")
-                for d in group["variants"]:
-                    if d.get("status") == "no data":
-                        tip_lines.append(f"  {d['variant']}: no data")
-                    else:
-                        flag = '✓' if d.get('closeto', False) else '✗'
-                        gold_sign = ' (gold)' if d['variant'] == gold_vid else ''
-                        tip_lines.append(
-                            f"  {d['variant']+':':15} {d.get('dtype','?'):8} "
-                            f"xor={d.get('xorsum','?'):11} "
-                            f"Δ={d.get('max_diff', '?'):.9f} {flag}{gold_sign}"
-                        )
-            tooltip = "\n".join(tip_lines).replace(" ", nbsp)
-            comment = _json.dumps(
-                {"node_id": node_id, "stage": align_node.stage.name, "op_name": op_name, "steps": all_step_details},
-                ensure_ascii=False,
-            )
-
-            color = "#4472C4" if align_node.stage == Stage.FORWARD else "#AD683A"
-            return {
-                "label": label,
-                "tooltip": tooltip,
-                "comment": comment,
-                "style": "filled",
-                "fillcolor": "#DEEBF7" if align_node.stage == Stage.FORWARD else "#FBE5D6",
-                "color": color,
-                "fontcolor": "#333333",
-            }
-
-        g = graphviz.Digraph("AlignmentGraph",
-            graph_attr={"rankdir": "TB", "newrank": "true", "fontname": "Helvetica", "fontsize": "12"},
-            node_attr={"shape": "box", "style": "rounded,filled", "fontname": "Courier", "fontsize": "10"},
-            edge_attr={"fontsize": "9"},
-        )
-
-        with g.subgraph(name="cluster_forward") as fw:
-            fw.attr(label="Forward", style="solid", color="#4472C4", fontcolor="#4472C4", fontsize="18")
-            for nid in sorted(fw_nodes):
-                fw.node(f"n{nid}", **_build_node_attrs(nid, fw_nodes[nid]))
-
-        with g.subgraph(name="cluster_backward") as bw:
-            bw.attr(label="Backward", style="solid", color="#ED7D31", fontcolor="#ED7D31", fontsize="18")
-            for nid in sorted(bw_nodes):
-                bw.node(f"n{nid}", **_build_node_attrs(nid, bw_nodes[nid]))
-
-        for fw_id, bw_id in sorted(agraph.grad_links.items()):
-            with g.subgraph() as s:
-                s.attr(rank="same")
-                s.node(f"n{fw_id}")
-                s.node(f"n{bw_id}")
-
-        for src_id, dst_ids in sorted(agraph.topology.items()):
-            for dst_id in sorted(set(dst_ids)):
-                g.edge(f"n{src_id}", f"n{dst_id}")
-
-        for fw_id, bw_id in sorted(agraph.grad_links.items()):
-            g.edge(f"n{fw_id}", f"n{bw_id}", style="dotted", color="#000000", constraint="false")
-
-        g.save(fpath)
-        print(f"DOT file written to {fpath}")
-        return g
+    def export_dot(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None, steps: list[int] = None, fpath: str = "align_graph.dot"):
+        return AlignmentVisualizer().export_dot(self.get_graph(agraph_id), variant_ids=variant_ids, gold_vid=gold_vid, steps=steps, fpath=fpath)
 
 
 class AlignedModelGenerator:
-    """Produces one instrumented model variant (compiled **or** eager). One instance could only use once."""
+    """Produces one instrumented model variant (compiled or eager). One instance could only use once."""
     class MarkerInjectFunctionMode(TorchFunctionMode):
         def __init__(self, ctx: 'AlignedModelGenerator'):
             super().__init__()
@@ -337,7 +284,7 @@ class AlignedModelGenerator:
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
-            if not self._disabled:
+            if (not self._disabled and not self._ctx._is_noop(func, args, kwargs)):
                 result = self._inject_markers(result)
             return result
 
@@ -361,45 +308,74 @@ class AlignedModelGenerator:
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
-            print(f"func_name={func.__name__}, args_types={[t.__name__ for t in types]}, result_type={type(result).__name__}, result_shape={getattr(result, 'shape', None)}")
-            self._instrument(result)
+            if (not self._ctx._is_noop(func, args, kwargs)):
+                self._instrument(result, func)
             return result
-
-        def _instrument(self, result):
-            if isinstance(result, torch.Tensor):
-                if result.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                    node_id = self._next_node_id
-                    self._next_node_id += 1
-                    torch.ops.xpugraph.instrument(
-                        result,
-                        node_id,
-                        Stage.FORWARD,
-                        self._ctx._agraph_id,
-                        self._ctx._variant_id
-                    )
-                    if result.requires_grad:
-                        def _bw_hook(grad, nid=node_id, mode=self):
-                            bw_nid = nid + mode._next_node_id  # bw nid typically offset from fw nid by total number of fw markers (e.g., _next_node_id).
-                            mode._ctx._agraph.add_grad_link(nid, bw_nid)
-                            torch.ops.xpugraph.instrument(
-                                grad,
-                                bw_nid,
-                                Stage.BACKWARD,
-                                mode._ctx._agraph_id,
-                                mode._ctx._variant_id
-                            )
-                        result.register_hook(_bw_hook)
-            elif isinstance(result, (tuple, list)) and all(isinstance(item, torch.Tensor) for item in result):
-                for item in result:
-                    self._instrument(item)
 
         def reset_id_counter(self):
             self._next_node_id = 0
 
+        def _instrument(self, result, func):
+            pytree.tree_map_only(torch.Tensor, lambda tensor: self._instrument_tensor(tensor, func), result)
+
+        def _instrument_tensor(self, result: torch.Tensor, func):
+            if result.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                return
+            node_id = self._next_node_id
+            self._next_node_id += 1
+            opinfo = OpInfo(op="eager", target=OpInfo.normalize_target(func), name=getattr(func, "__name__", None))
+            self._ctx._agraph.get_node(node_id, Stage.FORWARD).set_meta("op_meta", self._ctx._variant_id, {
+                    "last_op": opinfo,
+                    "last_non_trivial_op": None,
+            })
+            torch.ops.xpugraph.instrument(result, node_id, Stage.FORWARD, self._ctx._agraph_id, self._ctx._variant_id)
+            if result.requires_grad:
+                result_grad_fn = result.grad_fn
+                def _bw_hook(grad, nid=node_id, mode=self):
+                    bw_nid = nid + mode._next_node_id  # bw nid typically offset from fw nid by total number of fw markers (e.g., _next_node_id).
+                    mode._ctx._agraph.add_grad_link(nid, bw_nid)
+                    target = type(result_grad_fn).__name__ if result_grad_fn is not None else "UnknownBackward"
+                    bw_opinfo = OpInfo(op="autograd", target=target, name=target)
+                    mode._ctx._agraph.get_node(bw_nid, Stage.BACKWARD).set_meta("op_meta", mode._ctx._variant_id, {
+                            "last_op": bw_opinfo,
+                            "last_non_trivial_op": None,
+                    })
+                    torch.ops.xpugraph.instrument(grad, bw_nid, Stage.BACKWARD, mode._ctx._agraph_id, mode._ctx._variant_id)
+                result.register_hook(_bw_hook)
+
+    @classmethod
+    def _is_noop(cls, func, args, kwargs=None) -> bool:
+        _NOOP_DTYPE_METHODS = {
+            "float": torch.float32,
+            "double": torch.float64,
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        if not args or not isinstance(args[0], torch.Tensor):
+            return False
+        x = args[0]
+        func_name = getattr(func, "__name__", None)
+
+        if func_name in _NOOP_DTYPE_METHODS:
+            return x.dtype == _NOOP_DTYPE_METHODS[func_name]
+        if func_name == "cpu":
+            return x.device.type == "cpu"
+        if func_name == "contiguous":
+            kwargs = kwargs or {}
+            memory_format = kwargs.get("memory_format", torch.contiguous_format)
+            if memory_format is torch.contiguous_format:
+                return x.is_contiguous()
+            if memory_format is torch.channels_last:
+                return x.is_contiguous(memory_format=torch.channels_last)
+            if memory_format is torch.channels_last_3d:
+                return x.is_contiguous(memory_format=torch.channels_last_3d)
+            return False
+        return False
+
     def __init__(self, agraph_id: str, variant_id: str):
         self._mgr: AlignmentManager = AlignmentManager()
-        self._agraph_id:str = agraph_id
-        self._variant_id:str = variant_id
+        self._agraph_id: str = agraph_id
+        self._variant_id: str = variant_id
         self._agraph: AlignmentGraph = self._mgr.get_graph(agraph_id)
         self._marker_inject_mode = self.MarkerInjectFunctionMode(self)
         self._eager_instrument_mode = self.EagerInstrumentFunctionMode(self)
@@ -412,8 +388,8 @@ class AlignedModelGenerator:
 
         def alignment_fw_compiler(gm: torch.fx.GraphModule, example_inputs):
             fw_marker_count[0] = sum(1 for n in gm.graph.nodes if n.target == torch.ops.xpugraph.marker.default)
-            gm = self._mgr.inject_marker_meta_and_remove_marker_fw_pass(self._agraph_id, gm)
-            self._mgr.build_topology_from_fxgraph(self._agraph_id, gm.graph)
+            gm = self._mgr.inject_marker_meta_and_remove_marker_fw_pass(self._agraph_id, variant_id, gm)
+            self._mgr.build_topology_from_fxgraph(self._agraph_id, variant_id, gm.graph)
             # any optimization pass...
             gm = self._mgr.insert_instrument_nodes_pass(Stage.FORWARD, self._agraph_id, variant_id, gm)
             print("="*20+"\nAfter aot_autograd (forward)\n"+"="*20)
@@ -422,8 +398,8 @@ class AlignedModelGenerator:
 
         def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
             bw_offset = fw_marker_count[0]
-            gm = self._mgr.inject_marker_meta_and_remove_marker_bw_pass(self._agraph_id, bw_offset, gm)
-            self._mgr.build_topology_from_fxgraph(self._agraph_id, gm.graph)
+            gm = self._mgr.inject_marker_meta_and_remove_marker_bw_pass(self._agraph_id, variant_id, bw_offset, gm)
+            self._mgr.build_topology_from_fxgraph(self._agraph_id, variant_id, gm.graph)
             # any optimization pass...
             gm = self._mgr.insert_instrument_nodes_pass(Stage.BACKWARD, self._agraph_id, variant_id, gm)
             print("="*20+"\nAfter aot_autograd (backward)\n"+"="*20)
@@ -440,7 +416,8 @@ class AlignedModelGenerator:
                 fw_compiler=alignment_fw_compiler,
                 bw_compiler=alignment_bw_compiler,
                 partition_fn=(
-                    torch.functorch.partitioners.min_cut_rematerialization_partition if torch.__version__ >= "2.8" 
+                    torch.functorch.partitioners.min_cut_rematerialization_partition
+                    if torch.__version__ >= "2.8"
                     else torch._functorch.partitioners.default_partition
                 ),
             )
