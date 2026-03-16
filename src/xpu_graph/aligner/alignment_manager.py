@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch.overrides import TorchFunctionMode
+import torch.utils._pytree as pytree
 
 from .alignment_graph import AlignmentGraph, AlignmentNode, GraphMapping, Stage
 
@@ -341,14 +342,12 @@ class AlignedModelGenerator:
             return result
 
         def _inject_markers(self, result):
-            if isinstance(result, torch.Tensor):
-                if result.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                    return torch.ops.xpugraph.marker(result, self._new_node_id())
-            elif isinstance(result, (tuple, list)) and all(isinstance(item, torch.Tensor) for item in result):
-                items = [self._inject_markers(item) for item in result]
-                return type(result)(items)
-            return result
-
+            def _inject_tensor(t):
+                if isinstance(t, torch.Tensor) and t.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    return torch.ops.xpugraph.marker(t, self._new_node_id())
+                return t
+            return pytree.tree_map(_inject_tensor, result)
+        
         def _new_node_id(self) -> int:
             ret = self._next_node_id
             self._next_node_id += 1
@@ -362,6 +361,7 @@ class AlignedModelGenerator:
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
+            print(f"func_name={func.__name__}, args_types={[t.__name__ for t in types]}, result_type={type(result).__name__}, result_shape={getattr(result, 'shape', None)}")
             self._instrument(result)
             return result
 
@@ -416,6 +416,8 @@ class AlignedModelGenerator:
             self._mgr.build_topology_from_fxgraph(self._agraph_id, gm.graph)
             # any optimization pass...
             gm = self._mgr.insert_instrument_nodes_pass(Stage.FORWARD, self._agraph_id, variant_id, gm)
+            print("="*20+"\nAfter aot_autograd (forward)\n"+"="*20)
+            gm.print_readable()
             return functorch.compile.make_boxed_func(gm.forward)
 
         def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
@@ -424,16 +426,23 @@ class AlignedModelGenerator:
             self._mgr.build_topology_from_fxgraph(self._agraph_id, gm.graph)
             # any optimization pass...
             gm = self._mgr.insert_instrument_nodes_pass(Stage.BACKWARD, self._agraph_id, variant_id, gm)
+            print("="*20+"\nAfter aot_autograd (backward)\n"+"="*20)
+            gm.print_readable()
             return functorch.compile.make_boxed_func(gm.forward)
 
         def backend(gm: torch.fx.GraphModule, example_inputs):
-            from torch._functorch.partitioners import min_cut_rematerialization_partition
+            print("="*20+"\nBefore aot_autograd\n"+"="*20)
+            gm.print_readable(include_stride=True)
+            
             gm = aot_module_simplified(
                 gm,
                 example_inputs,
                 fw_compiler=alignment_fw_compiler,
                 bw_compiler=alignment_bw_compiler,
-                partition_fn=min_cut_rematerialization_partition,
+                partition_fn=(
+                    torch.functorch.partitioners.min_cut_rematerialization_partition if torch.__version__ >= "2.8" 
+                    else torch._functorch.partitioners.default_partition
+                ),
             )
             # disable dynamo guards to avoid recompile.
             tracing_context = torch._guards.TracingContext.try_get()
@@ -450,10 +459,7 @@ class AlignedModelGenerator:
         with self._marker_inject_mode:
             compiled_fn = torch.compile(model, backend=self._make_backend(), dynamic=True, fullgraph=True)
             out = compiled_fn(*args, **kwargs)
-            flat_out, _ = torch.utils._pytree.tree_flatten(out)
-            tensors_req = [v for v in flat_out if isinstance(v, torch.Tensor) and v.requires_grad]
-            for t in tensors_req:
-                t.backward(torch.ones_like(t))
+            pytree.tree_map_only_(torch.Tensor, lambda t: t.backward(torch.ones_like(t)) if t.requires_grad else None, out)
         self._marker_inject_mode._disabled = True
         # clear recorded data during warmup
         self._mgr.get_graph(self._agraph_id).clear_data()
