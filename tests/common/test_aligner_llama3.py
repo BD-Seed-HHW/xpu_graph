@@ -71,3 +71,11 @@ if __name__ == "__main__":
 
     xpu_graph.aligner.mgr.print_data("Llama3", ["cpu_32", "eager_32", "compile_32", "eager_16", "compile_16"], gold_vid="cpu_32")
     xpu_graph.aligner.mgr.export_dot("Llama3", ["cpu_32", "eager_32", "compile_32", "eager_16", "compile_16"], gold_vid="cpu_32", steps=[0,1], fpath="llama3_align.dot")
+    
+    xpu_graph.aligner.mgr.export_viewer(
+        "Llama3",
+        ["cpu_32", "eager_32", "compile_32", "eager_16", "compile_16"],
+        gold_vid="cpu_32",
+        steps=[0, 1],
+        out_dir="./viewer/llama3",
+    )

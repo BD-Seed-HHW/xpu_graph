@@ -74,6 +74,7 @@ class AlignmentNode:
     stage: Stage
     meta: dict[str, dict[str, Any]] = field(default_factory=dict)  # field -> variant_id -> value
     data: dict[str, list] = field(default_factory=dict)  # variant_id -> list of (xorsum, tensor, ...) pairs
+    module_stack: Any = None
 
     def record_data(self, variant_id: str, *args):
         self.data.setdefault(variant_id, []).append(args)
@@ -89,10 +90,14 @@ class AlignmentNode:
 class AlignmentEdge:
     """Represents a directed edge between two ``AlignmentNode``s, recording ops executed between them."""
     id: int
-    src_id: int
-    dst_id: int
+    src: int
+    dst: int
     ops: tuple[OpInfo] = ()
     variant_ids: set[str] = field(default_factory=set)
+
+    @property
+    def signature(self) -> tuple[Any, ...]:
+        return tuple(op.signature for op in self.ops)
 
 
 class AlignmentGraph:
@@ -114,7 +119,7 @@ class AlignmentGraph:
         self._nodes: dict[int, AlignmentNode] = {}
         self._edges: dict[int, AlignmentEdge] = {}
         self._topology: dict[int, list[int]] = {}  # src_id -> edge_ids
-        self._edge_lookup: dict[tuple[int, int, tuple[tuple[Any, ...], ...]], int] = {}
+        self._edge_lookup: dict[tuple[int, int, tuple[tuple[Any, ...], ...]], int] = {}  # (src, dst, edge_signature) -> edge_id
         self._variant_edges: dict[str, set[int]] = {}
         self._grad_links: dict[int, int] = {}  # fw_node_id -> bw_node_id
         self._variant_ids: set[str] = set()
@@ -128,38 +133,49 @@ class AlignmentGraph:
     def edges(self) -> dict[int, AlignmentEdge]:
         return self._edges
     @property
-    def topology(self) -> dict[int, list[int]]:
-        return {src_id: list(edge_ids) for src_id, edge_ids in self._topology.items()}
-    @property
     def grad_links(self) -> dict[int, int]:
         return self._grad_links
+    
+    def register_variant(self, variant_id: str):
+        if variant_id not in self._variant_ids:
+            self._variant_ids.add(variant_id)
+            self._variant_edges.setdefault(variant_id, set())
+            self._collapsed_fw_node_ids.setdefault(variant_id, set())
     
     def get_node(self, node_id: int, stage: Stage = Stage.FORWARD) -> AlignmentNode:
         if node_id not in self._nodes:
             self._nodes[node_id] = AlignmentNode(id=node_id, stage=stage)
         return self._nodes[node_id]
 
-    def add_edge(self, variant_id: str, src_id: int, dst_id: int, ops: tuple[OpInfo, ...]) -> AlignmentEdge:
+    def add_edge(self, variant_id: str, src: int, dst: int, ops: tuple[OpInfo, ...]) -> AlignmentEdge:
         edge_signature = tuple(op.signature for op in ops)
-        edge_key = (src_id, dst_id, edge_signature)
-        edge_id = self._edge_lookup.get(edge_key)
+        edge_id = self._edge_lookup.get((src, dst, edge_signature))
         if edge_id is None:
             edge_id = self._next_edge_id
             self._next_edge_id += 1
             self._edges[edge_id] = AlignmentEdge(
                 id=edge_id,
-                src_id=src_id,
-                dst_id=dst_id,
+                src=src,
+                dst=dst,
                 ops=ops,
             )
-            self._edge_lookup[edge_key] = edge_id
-            self._topology.setdefault(src_id, []).append(edge_id)
+            self._edge_lookup[(src, dst, edge_signature)] = edge_id
+            self._topology.setdefault(src, []).append(edge_id)
 
         edge = self._edges[edge_id]
         edge.variant_ids.add(variant_id)
         self._variant_edges.setdefault(variant_id, set()).add(edge_id)
         return edge
 
+    def get_edges_between(self, src: int, dst: int, variant_id: str | None = None) -> list[AlignmentEdge]:
+        edge_ids = self._topology.get(src, [])
+        return [
+            self._edges[edge_id]
+            for edge_id in edge_ids
+            if self._edges[edge_id].dst == dst
+            and (variant_id is None or variant_id in self._edges[edge_id].variant_ids)
+        ]
+    
     def iter_edges(self, variant_id: str | None = None):
         if variant_id is None:
             for edge_id in sorted(self._edges):
@@ -167,15 +183,6 @@ class AlignmentGraph:
             return
         for edge_id in sorted(self._variant_edges.get(variant_id, set())):
             yield self._edges[edge_id]
-
-    def get_edges_between(self, src_id: int, dst_id: int, variant_id: str | None = None) -> list[AlignmentEdge]:
-        edge_ids = self._topology.get(src_id, [])
-        return [
-            self._edges[edge_id]
-            for edge_id in edge_ids
-            if self._edges[edge_id].dst_id == dst_id
-            and (variant_id is None or variant_id in self._edges[edge_id].variant_ids)
-        ]
 
     def add_grad_link(self, fw_node_id: int, bw_node_id: int):
         self._grad_links[fw_node_id] = bw_node_id
@@ -185,12 +192,6 @@ class AlignmentGraph:
 
     def is_fw_node_collapsed(self, variant_id: str, node_id: int) -> bool:
         return node_id in self._collapsed_fw_node_ids.get(variant_id, set())
-
-    def register_variant(self, variant_id: str):
-        if variant_id not in self._variant_ids:
-            self._variant_ids.add(variant_id)
-            self._variant_edges.setdefault(variant_id, set())
-            self._collapsed_fw_node_ids.setdefault(variant_id, set())
 
     def clear_data(self):
         for node in self._nodes.values():

@@ -160,6 +160,38 @@ class AlignmentManager:
         gm.recompile()
         return gm
 
+    def build_canonical_module_stack_pass(
+        self,
+        agraph_id: str,
+        stage: Stage,
+        gm: torch.fx.GraphModule,
+        bw_nid_offs: int = 0,
+    ) -> torch.fx.GraphModule:
+        """Persist one canonical raw ``nn_module_stack`` per ``AlignmentNode``."""
+        fxgraph: torch.fx.Graph = gm.graph
+        agraph: AlignmentGraph = self.get_graph(agraph_id)
+
+        for fxnode in fxgraph.nodes:
+            if fxnode.op != "call_function" or fxnode.target != torch.ops.xpugraph.marker.default:
+                continue
+
+            source_node: torch.fx.Node = fxnode.args[0]
+            fw_nid: int = fxnode.args[1]
+            nid = fw_nid if stage == Stage.FORWARD else fw_nid + bw_nid_offs
+
+            module_stack = source_node.meta.get("nn_module_stack", fxnode.meta.get("nn_module_stack"))
+            if module_stack is not None:
+                align_node = agraph.get_node(nid, stage)
+                if align_node.module_stack is None:
+                    align_node.module_stack = module_stack
+                else:
+                    pass
+                    # assert (
+                    #     align_node.module_stack == module_stack
+                    # ), f"AlignmentNode {nid} has inconsistent module_stack across variants"
+
+        return gm
+
     def inject_marker_meta_and_remove_marker_bw_pass(self, agraph_id: str, variant_id: str, bw_nid_offs: int, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         fxgraph: torch.fx.Graph = gm.graph
         agraph: AlignmentGraph = self.get_graph(agraph_id)
@@ -269,8 +301,19 @@ class AlignmentManager:
                     )
             print()
 
-    def export_dot(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None, steps: list[int] = None, fpath: str = "align_graph.dot"):
+    def export_dot(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None, steps: list[int] = None, with_module_stack: bool = False, fpath: str = "align_graph.dot"):
+        if with_module_stack:
+            return AlignmentVisualizer().export_dot_with_module_hierarchy(self.get_graph(agraph_id), variant_ids=variant_ids, gold_vid=gold_vid, steps=steps, fpath=fpath)
         return AlignmentVisualizer().export_dot(self.get_graph(agraph_id), variant_ids=variant_ids, gold_vid=gold_vid, steps=steps, fpath=fpath)
+
+    def export_viewer(self, agraph_id: str, variant_ids: list[str], gold_vid: Optional[str] = None, steps: list[int] | None = None, out_dir: str = "align_viewer"):
+        return AlignmentVisualizer().export_viewer(
+            self.get_graph(agraph_id),
+            variant_ids=variant_ids,
+            gold_vid=gold_vid,
+            steps=steps,
+            out_dir=out_dir,
+        )
 
 
 class AlignedModelGenerator:
@@ -370,6 +413,7 @@ class AlignedModelGenerator:
             if memory_format is torch.channels_last_3d:
                 return x.is_contiguous(memory_format=torch.channels_last_3d)
             return False
+        #TODO: func_name == "type_as" check will cause dynamo bug, fix and add it back.
         return False
 
     def __init__(self, agraph_id: str, variant_id: str):
@@ -388,6 +432,7 @@ class AlignedModelGenerator:
 
         def alignment_fw_compiler(gm: torch.fx.GraphModule, example_inputs):
             fw_marker_count[0] = sum(1 for n in gm.graph.nodes if n.target == torch.ops.xpugraph.marker.default)
+            gm = self._mgr.build_canonical_module_stack_pass(self._agraph_id, Stage.FORWARD, gm)
             gm = self._mgr.inject_marker_meta_and_remove_marker_fw_pass(self._agraph_id, variant_id, gm)
             self._mgr.build_topology_from_fxgraph(self._agraph_id, variant_id, gm.graph)
             # any optimization pass...
@@ -398,6 +443,7 @@ class AlignedModelGenerator:
 
         def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
             bw_offset = fw_marker_count[0]
+            gm = self._mgr.build_canonical_module_stack_pass(self._agraph_id, Stage.BACKWARD, gm, bw_nid_offs=bw_offset)
             gm = self._mgr.inject_marker_meta_and_remove_marker_bw_pass(self._agraph_id, variant_id, bw_offset, gm)
             self._mgr.build_topology_from_fxgraph(self._agraph_id, variant_id, gm.graph)
             # any optimization pass...
