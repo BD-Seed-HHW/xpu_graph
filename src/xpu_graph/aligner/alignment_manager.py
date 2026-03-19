@@ -11,6 +11,8 @@ import torch.utils._pytree as pytree
 
 from .alignment_graph import AlignmentGraph, GraphMapping, OpInfo, Stage
 from .visualize import AlignmentVisualizer
+import logging
+logger = logging.getLogger("xpu_graph")
 
 
 class AlignmentManager:
@@ -29,6 +31,7 @@ class AlignmentManager:
         self._mappings: list[GraphMapping] = []
         self._register_ops()
         AlignmentManager._initialized = True
+        logger.info("[ALIGNER] AlignmentManager initialized")
 
     @property
     def graphs(self) -> dict[str, AlignmentGraph]:
@@ -89,7 +92,7 @@ class AlignmentManager:
     @staticmethod
     def xorsum32(t: torch.Tensor) -> int:
         t = t.detach()
-        b = t.contiguous().view(torch.uint8).reshape(-1)
+        b = t.contiguous().reshape(-1).view(torch.uint8)
         pad_bytes = (-b.numel()) % 4
         if pad_bytes > 0:
             b = F.pad(b, (0, pad_bytes))
@@ -511,16 +514,13 @@ class AlignedModelGenerator:
             raise RuntimeError("An AlignedModelGenerator instance can only generate once. Create a new one for another generation.")
 
         eager_inst_mode = self._eager_instrument_mode
-        class _WrapModule(nn.Module):
-            def __init__(wself, mdl):
-                super().__init__()
-                wself._model = mdl
-
-            def forward(wself, *args, **kwargs):
-                eager_inst_mode.reset_id_counter()  # reset node id counter for each forward to keep them consistent across variants
-                with eager_inst_mode:
-                    return wself._model(*args, **kwargs)
-        wrapped_model = _WrapModule(model)
+        original_forward = model.forward
+        def wrapped_forward(*args, **kwargs):
+            eager_inst_mode.reset_id_counter()  # reset node id counter for each forward to keep them consistent across variants
+            with eager_inst_mode:
+                result = original_forward(*args, **kwargs)
+            return result
+        model.forward = wrapped_forward
 
         self._generated = True
-        return wrapped_model
+        return model
