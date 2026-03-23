@@ -16,7 +16,7 @@ from xpu_graph.utils import logger, setup_logger
 from tests.npu.test_dist_utils import cleanup, dist_setup
 
 from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ToyConfig
-from .parallel_dims import ParallelizeDims
+from .parallel_dims import ParallelDims
 
 
 def compute_tensor_xor(tensor: torch.Tensor) -> int:
@@ -54,7 +54,7 @@ class TrainConfig:
 
     num_samples: int = 4096 # Number of samples in the training dataset
 
-    parallelize_dims: ParallelizeDims = None # Parallelize dimensions
+    parallelize_dims: ParallelDims = None # Parallelize dimensions
     parallelize_fn: Callable = None # Parallelize function
 
     # debug setting
@@ -80,11 +80,11 @@ class SimpleDataset(Dataset):
         return self.len
 
 
-def get_dataloader(batch_size, num_samples, shuffle=False, path: str = None):
+def get_dataloader(batch_size, num_samples, shuffle=False, path: str = None, dp_rank: int = 0, dp_size: int = 1):
     dataset = SimpleDataset(path, num_samples)
     sampler = None
     if dist.is_initialized():
-        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=True)
+        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=True, rank=dp_rank, num_replicas=dp_size)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -127,7 +127,7 @@ def compile_model(model: Qwen3ForCausalLM, xpu_graph_config: XpuGraphConfig):
         xpu_graph_config,
         module_bucket_plans=module_bucket_plans,
     )
-    model = torch.compile(model, backend=xpu_graph_backend)
+    model = torch.compile(model, backend=xpu_graph_backend, fullgraph=True)
     logger.info("compile model successfully")
     return model
 
@@ -168,10 +168,14 @@ def forward_backward_step(model, optimizer, loss_fn, data, target, rank):
 def train(rank, train_config, path, xpu_graph_config):
     setup_logger(is_debug=True)
     rank = rank
-    model = Qwen3ForCausalLM(train_config.model_config)
-    model.load_state_dict(torch.load(train_config.model_path))
     if train_config.parallelize_dims.world_size > 1:
         dist_setup(rank, train_config.parallelize_dims.world_size)
+    model = Qwen3ForCausalLM(train_config.model_config, parallel_dims=train_config.parallelize_dims, device=train_config.device)
+    model.load_state_dict(torch.load(train_config.model_path))
+    dp_rank = rank // train_config.parallelize_dims.tp
+    dp_size = train_config.parallelize_dims.world_size // train_config.parallelize_dims.tp
+
+    if train_config.parallelize_dims.world_size > 1:
         train_config.parallelize_fn(model, train_config.parallelize_dims)
     if train_config.is_compile:
         model = compile_model(model, xpu_graph_config)
@@ -181,7 +185,10 @@ def train(rank, train_config, path, xpu_graph_config):
     data_loader = get_dataloader(batch_size=mini_batch_size,
                                         num_samples=train_config.num_samples,
                                         shuffle=train_config.shuffle,
-                                        path=train_config.dataset_path)
+                                        path=train_config.dataset_path,
+                                        dp_rank=dp_rank,
+                                        dp_size=dp_size
+                                        )
     model.train().to(train_config.device)
     torch.set_grad_enabled(True)
     global global_step
@@ -198,7 +205,6 @@ def train(rank, train_config, path, xpu_graph_config):
         for batch_idx, (data, target) in enumerate(data_loader):
             global_step += 1
             data, target = data.to(train_config.device), target.to(train_config.device)
-
             loss, grad_xors, host_time_step, npu_time_step, e2e_time_step = \
                 forward_backward_step(model, optimizer, loss_fn, data, target, rank)
             host_time += host_time_step

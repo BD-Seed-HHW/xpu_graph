@@ -9,6 +9,8 @@ from torch.utils._ordered_set import OrderedSet
 from xpu_graph.fx_utils import FxStage
 from xpu_graph.passes.optimizer import Optimizer
 
+from .bucketing_utils import is_all_gather_into_tensor, is_reduce_scatter_tensor, is_wait_tensor
+
 #  adapted from https://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/overlap_manual_scheduling.py
 
 def _get_flat_args_unique(
@@ -79,7 +81,7 @@ def _stable_topological_sort(
 class Reordering(Optimizer):
 
     _support_stages = [
-        FxStage.inference,
+        # FxStage.inference,
         FxStage.forward,
         FxStage.backward,
     ]
@@ -89,11 +91,13 @@ class Reordering(Optimizer):
         self.gm = gm
         self.graph = gm.graph
         self.in_degree = Counter(user for node in self.graph.nodes for user in node.users)
-        # if torch.distributed.get_rank() == 0:
-        #     print(f"before reordering, graph :\n{gm.print_readable()}")
+        if torch.distributed.get_rank() == 0:
+            print(f"before reordering, graph :\n{gm.print_readable()}")
         before_nodes = list(self.graph.nodes)
         self._manual_reorder_graph()
         after_nodes = list(self.graph.nodes)
+        if torch.distributed.get_rank() == 0:
+            print(f"after reordering, graph :\n{gm.print_readable()}")
         return before_nodes != after_nodes
 
     def _schedule(self, node: fx.Node) -> None:
@@ -103,7 +107,7 @@ class Reordering(Optimizer):
         for user in node.users:
             self.in_degree[user] -= 1
             if self.in_degree[user] == 0:
-                heapq.heappush(self.ready, user)
+                heapq.heappush(self.ready, (self.node_idx[user], user))
 
     def _manual_reorder_graph(self) -> None:
         """
@@ -117,25 +121,29 @@ class Reordering(Optimizer):
 
         for node in self.graph.nodes:
             if self.in_degree[node] == 0:
-                heapq.heappush(self.ready, node)
+                heapq.heappush(self.ready, (self.node_idx[node], node))
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(f"ready: {self.ready}")
         while self.ready:
-            node = heapq.heappop(self.ready)
-            node_type = node.meta.get("manual_bucket_node_type", "")
-
+            _, node = heapq.heappop(self.ready)
+            is_rs = is_reduce_scatter_tensor(node)
+            is_rs_wait = is_wait_tensor(node) and is_reduce_scatter_tensor(node.args[0])
+            # if rank == 0:
+            #     print(f"node: {node}, is_rs: {is_rs}, is_rs_wait: {is_rs_wait}")
             if node in self.scheduled:
                 continue
 
-            if node_type == "bucketed_reduce_scatter":
+            if is_rs:
                 for delayed in delayed_rs_nodes:
                     self._schedule(delayed)
                     overlap_deps[delayed].add(node)
                 delayed_rs_nodes.clear()
 
-            elif node_type == "bucketed_reduce_scatter_wait":
+            elif is_rs_wait:
                 delayed_rs_nodes.append(node)
                 continue
             self._schedule(node)
-
         for delayed in delayed_rs_nodes:
             self._schedule(delayed)
 
@@ -143,16 +151,18 @@ class Reordering(Optimizer):
         picked_ag: list[fx.Node] = []
 
         for node in self.scheduled:
-            node_type = node.meta.get("manual_bucket_node_type", "")
-            if node_type == "bucketed_all_gather":
+            is_ag = is_all_gather_into_tensor(node)
+            is_ag_wait = is_wait_tensor(node) and is_all_gather_into_tensor(node.args[0])
+            if is_ag:
                 picked_ag.append(node)
                 continue
 
-            if node_type == "bucketed_all_gather_wait":
+            if is_ag_wait:
                 if picked_ag:
                     reversed_picked_ag = list(reversed(picked_ag))
                     for ag in reversed_picked_ag:
                         overlap_deps[node].add(ag)
                 picked_ag.clear()
+        print(f"overlap_deps: {overlap_deps}")
         _stable_topological_sort(self.graph, overlap_deps)
         self.graph.lint()

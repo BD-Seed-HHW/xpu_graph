@@ -24,15 +24,17 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.placement_types import Placement, _StridedShard
 from xpu_graph.utils import logger
 
-from .parallel_dims import ParallelizeDims
+from tests.npu.train_utils.parallel_dims import ParallelDims
 
 _active_parametrization = True
 
-def parallelize_model(model: nn.Module, parallelize_dims: ParallelizeDims):
+def parallelize_model(model: nn.Module, parallel_dims: ParallelDims):
     logger.info(f"begin parallelize {model.__class__.__name__}")
-    if parallelize_dims.dp_replicate > 1 or parallelize_dims.dp_shard > 1 or parallelize_dims.cp > 1:
-        assert parallelize_dims.dp_replicate == 1, "dp_replicate must be 1"
-        apply_fsdp(model, parallelize_dims.get_mesh("fsdp"), mode="fully_shard")
+    # if parallel_dims.tp > 1:
+    #     apply_tp(model, parallel_dims.get_mesh("tp"))
+    if parallel_dims.dp_replicate > 1 or parallel_dims.dp_shard > 1 or parallel_dims.cp > 1:
+        assert parallel_dims.dp_replicate == 1, "dp_replicate must be 1"
+        apply_fsdp(model, parallel_dims.get_mesh("fsdp"), mode="fully_shard")
     logger.info(f"finish parallelize {model.__class__.__name__}")
     return model
 
@@ -101,7 +103,7 @@ def _distribute_dtensor(
     """
     inner_spec = tensor._spec
     outer_mesh, inner_mesh = device_mesh, inner_spec.mesh
-    spanned_mesh = DeviceMesh._concatenate([outer_mesh, inner_mesh])
+    # spanned_mesh = DeviceMesh._concatenate([outer_mesh, inner_mesh])
 
     if len(dp_placements) == 1:
         assert dp_placements[0].is_replicate() or dp_placements[0].is_shard()
@@ -155,15 +157,16 @@ def _distribute_dtensor(
         current_spec=current_spec,
         target_spec=target_spec,
     )
-    return DTensor(
-        result_tensor.requires_grad_(tensor.requires_grad),
-        DTensorSpec(
-            mesh=spanned_mesh,
-            placements=tensor_placement,
-            tensor_meta=inner_spec.tensor_meta,
-        ),
-        requires_grad=tensor.requires_grad,
-    )
+    # return DTensor(
+    #     result_tensor.requires_grad_(tensor.requires_grad),
+    #     DTensorSpec(
+    #         mesh=spanned_mesh,
+    #         placements=tensor_placement,
+    #         tensor_meta=inner_spec.tensor_meta,
+    #     ),
+    #     requires_grad=tensor.requires_grad,
+    # )
+
 
 
 def _register_parametrization(
@@ -238,10 +241,9 @@ class ReplicateComputation(torch.nn.Module):
 
             # the actual FSDP's fwd all-gather & bwd reduce-scatter
             # DDP's bwd all-reduce on dp_mesh
+            print(f"grad_placements: {self.grad_placements}, dp_mesh: {dp_mesh}, param_sharding: {self.param_sharding}")
             replicated_dtensor = sharded_dtensor.redistribute(
                 placements=self.compute_placements,
-                forward_dtype=self.param_dtype,
-                backward_dtype=self.reduce_dtype,
             )
 
             # re-wrap all-gathered DTensor on dp_mesh to be on non_dp_mesh
@@ -255,15 +257,13 @@ class ReplicateComputation(torch.nn.Module):
                 x._spec.mesh.mesh_dim_names[-non_dp_mesh_dims:]
             )
             non_dp_mesh = x._spec.mesh[non_dp_mesh_dim_names]
-
+            # print(f"non_dp_mesh: {non_dp_mesh}, non_dp_placements: {non_dp_placements}, non_dp_mesh_dim_names: {non_dp_mesh_dim_names}")
             output = DTensor.from_local(
                 replicated_local_tensor, non_dp_mesh, non_dp_placements
             )
         elif non_dp_mesh_dims == 0:
             output = x.redistribute(
                 placements=self.compute_placements,
-                # forward_dtype=self.param_dtype,
-                # backward_dtype=self.reduce_dtype,
             )
 
             if not self.full_dtensor:
@@ -313,7 +313,7 @@ def apply_fsdp(
         raise ValueError(f"Unsupported mode {mode}")
 
     modules = list(model.modules())
-    print(f"device_mesh: {device_mesh}")
+    print(f"fsdp_mesh: {device_mesh}")
     for mod in modules:
         params_dict = dict(mod.named_parameters(recurse=False))
         # we shouldn't apply data parallel to the modules that are already
@@ -365,7 +365,7 @@ def apply_fsdp(
 def apply_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
-    loss_parallel: bool,
+    loss_parallel: bool = True,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -373,19 +373,26 @@ def apply_tp(
     # 2. Parallelize the root norm layer over the sequence dim
     # 3. Parallelize the final linear output layer
     parallelize_module(
-        model,
+        model,          # ← 注意：直接拿 Qwen3ForCausalLM.model
         tp_mesh,
         {
-            "model.model.embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(1),
-            ),
-            "model.model.norm": SequenceParallel(),
-            "model.lm_head": ColwiseParallel(
+            "lm_head": ColwiseParallel(
                 input_layouts=Shard(1),
                 output_layouts=Shard(-1) if loss_parallel else Replicate(),
                 use_local_output=not loss_parallel,
             ),
+        },
+    )
+
+    parallelize_module(
+        model.model,
+        tp_mesh,
+        {
+            "embed_tokens": RowwiseParallel(
+                # input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "norm": SequenceParallel(),
         },
     )
 
@@ -400,37 +407,33 @@ def apply_tp(
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
     #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
     # pyrefly: ignore [not-callable]
-    for transformer_block in model.model.layers.values():
-        layer_plan = {
-            "": SequenceParallel(),
-            # NOTE: when the fourth argument (positions) is not None, its input layout
-            # and desired input layout is still None as we don't convert freqs_cis to
-            # a DTensor for llama3.
-            # TODO: https://github.com/pytorch/torchtitan/pull/2149 would fix this
-            # inconsistency.
-            "self_attn": prepare_module_input(
-                input_layouts=(Shard(1), None, None),
-                desired_input_layouts=(Replicate(), None, None),
-            ),
-            "self_attn.q_proj": colwise_parallel(),
-            "self_attn.k_proj": colwise_parallel(),
-            "self_attn.v_proj": colwise_parallel(),
-            "self_attn.o_proj": rowwise_parallel(output_layouts=Shard(1)),
-            "ffn_norm": SequenceParallel(),
-            "mlp": prepare_module_input(
-                input_layouts=(Shard(1),),
-                desired_input_layouts=(Replicate(),),
-            ),
-            "mlp.gate_proj": colwise_parallel(),
-            "mlp.up_proj": colwise_parallel(),
-            "mlp.down_proj": rowwise_parallel(output_layouts=Shard(1)),
-        }
-
+    for transformer_block in model.model.layers:
         parallelize_module(
-            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
-            # pyrefly: ignore [bad-argument-type]
-            parallelize_plan=layer_plan,
-        )
+            parallelize_plan={
+                "input_layernorm": SequenceParallel(),
+                # NOTE: when the fourth argument (positions) is not None, its input layout
+                # and desired input layout is still None as we don't convert freqs_cis to
+                # a DTensor for llama3.
+                # TODO: https://github.com/pytorch/torchtitan/pull/2149 would fix this
+                # inconsistency.
+                "self_attn": prepare_module_input(
+                    input_layouts=(Shard(1), None, None),
+                    desired_input_layouts=(Replicate(), None, None),
+                ),
+                "self_attn.q_proj": colwise_parallel(),
+                "self_attn.k_proj": colwise_parallel(),
+                "self_attn.v_proj": colwise_parallel(),
+                "self_attn.o_proj": rowwise_parallel(output_layouts=Shard(1)),
+                "post_attention_layernorm": SequenceParallel(),
+                "mlp": prepare_module_input(
+                    input_layouts=(Shard(1),),
+                    desired_input_layouts=(Replicate(),),
+                ),
+                "mlp.gate_proj": colwise_parallel(),
+                "mlp.up_proj": colwise_parallel(),
+                "mlp.down_proj": rowwise_parallel(output_layouts=Shard(1)),
+        })
+
     logger.info(f"Apply TP to {model.__class__.__name__}")

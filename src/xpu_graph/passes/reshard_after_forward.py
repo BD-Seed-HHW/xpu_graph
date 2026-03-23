@@ -45,10 +45,8 @@ class ReshardAfterForward(Optimizer):
     ]
 
     def process(self, gm: fx.GraphModule):
-        change_graph = False
         for node in gm.graph.nodes:
             if is_wait_tensor_from_fsdp(node):
-                change_graph = True
                 ag_node = node.args[0]
                 force_recompute_node(ag_node)  # all_gather
                 force_recompute_node(node)  # wait_tensor
@@ -67,4 +65,4 @@ class ReshardAfterForward(Optimizer):
                     == torch.ops.prims.convert_element_type.default
                 ):
                     force_recompute_node(ag_node.all_input_nodes[0])
-        return change_graph
+        return False

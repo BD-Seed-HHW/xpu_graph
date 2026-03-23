@@ -10,15 +10,15 @@ from tests.npu.test_dist_utils import cleanup, dist_setup
 
 # Copied and simplified from torchtitan/distributed/parallel_dims.py
 @dataclass
-class ParallelizeDims:
-    dp_replicate: int # Replicate the Data across multiple devices
-    dp_shard: int # Shard the Data across multiple devices
-    cp: int # Context parallel size
-    tp: int # Tensor parallel size
-    pp: int # Pipeline parallel size
-    # ep: int # Expert parallel size
-    # etp: int # Expert tensor parallel size
-    world_size: int # World size
+class ParallelDims:
+    dp_replicate: int
+    dp_shard: int
+    cp: int
+    tp: int
+    pp: int
+    ep: int
+    etp: int
+    world_size: int
 
     _meshes: dict[str, DeviceMesh] = field(default_factory=dict)
     _world_mesh: DeviceMesh | None = None
@@ -28,14 +28,16 @@ class ParallelizeDims:
         self._validate()
 
     def _validate(self):
-        dp_replicate, dp_shard, cp, tp, pp = (
+        dp_replicate, dp_shard, cp, tp, pp, ep, etp = (
             self.dp_replicate,
             self.dp_shard,
             self.cp,
             self.tp,
             self.pp,
+            self.ep,
+            self.etp,
         )
-        for d in (dp_replicate, cp, tp, pp):
+        for d in (dp_replicate, cp, tp, pp, ep, etp):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
 
         assert dp_shard == -1 or dp_shard >= 1, "dp_shard must -1 or >=1."
@@ -48,7 +50,14 @@ class ParallelizeDims:
             f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
         )
 
+        if ep > 1:
+            assert etp == tp or etp == 1, "Currently we only support ETP=TP or ETP=1"
+
     def _mesh_exist(self, name: str, degree: int) -> bool:
+        if name == "efsdp":
+            # We always keep the efsdp if EP is larger than 1 because we need
+            # FSDP wrapping to help the MoE layers do mixed precision training.
+            return True if self.ep > 1 else False
         return degree > 1
 
     def build_mesh(self) -> DeviceMesh:
@@ -60,8 +69,7 @@ class ParallelizeDims:
             pp:      Pipeline Parallelism (PP).
             batch:   Used by data loading to determine the global batch size and which
                      part of the data each rank should read. This dimension includes both
-                     ``dp_replicate`` and ``dp_shard``. The backend is set to ``fake`` for
-                     this dimension to avoid unnecessary process group creation.
+                     ``dp_replicate`` and ``dp_shard``.
             loss:    Used by all-reduce when computing the loss. Includes ``dp_replicate``,
                      ``dp_shard``, and ``cp`` degrees, as all of them parallelize the data,
                      essentially require the weight gradients reduction.
@@ -95,45 +103,40 @@ class ParallelizeDims:
         logger.info(
             f"Building device mesh with parallelism: "
             f"pp={self.pp}, dp_replicate={self.dp_replicate}, dp_shard={self.dp_shard}, "
-            f"cp={self.cp}, tp={self.tp}"
+            f"cp={self.cp}, tp={self.tp}, ep={self.ep}, etp={self.etp}"
         )
 
-        batch = self.dp_replicate * self.dp_shard
         fsdp = self.dp_shard * self.cp
 
-        self._world_mesh = init_device_mesh(
-            self.device, (self.world_size,), mesh_dim_names=("world",)
+        # self._world_mesh = init_device_mesh(
+        #     self.device, (self.world_size,), mesh_dim_names=("world",)
+        # )
+        self.dense_mesh = init_device_mesh(
+            self.device, (self.pp, self.dp_replicate, fsdp, self.tp), mesh_dim_names=("pp", "dp_replicate", "fsdp", "tp")
         )
-        dataloading_mesh = init_device_mesh(
-            self.device,
-            (self.pp, batch, self.cp, self.tp),
-            mesh_dim_names=("pp", "batch", "cp", "tp")
-        )
-        loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
-        dense_mesh = init_device_mesh(
-            self.device,
-            (self.pp, self.dp_replicate, fsdp, self.tp),
-            mesh_dim_names=("pp", "dp_replicate", "fsdp", "tp")
-        )
-
-        self._global_meshes = {
-            "dataloading": dataloading_mesh,
-            "loss": loss_mesh,
-            "dense": dense_mesh,
-        }
+        # dataloading_mesh = unflatten_mesh(
+        #     self._world_mesh,
+        #     ("pp", "batch", "cp", "tp"),
+        #     (self.pp, batch, self.cp, self.tp),
+        # )
+        # loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+        # dense_mesh = unflatten_mesh(
+        #     self._world_mesh,
+        #     ("pp", "dp_replicate", "fsdp", "tp"),
+        #     (self.pp, self.dp_replicate, fsdp, self.tp),
+        # )
+        # sparse_mesh = unflatten_mesh(
+        #     self._world_mesh,
+        #     ("pp", "dp_replicate", "efsdp", "ep", "etp"),
+        #     (self.pp, self.dp_replicate, efsdp, self.ep, self.etp),
+        # )
 
         self._meshes = {
-            "pp": dataloading_mesh["pp"],
-            "batch": dataloading_mesh["batch"],
-            "loss": loss_mesh,
-            "dp_replicate": dense_mesh["dp_replicate"],
-            "fsdp": dense_mesh["fsdp"],
-            "cp": dataloading_mesh["cp"],
-            "tp": dataloading_mesh["tp"],
+            "pp": self.dense_mesh["pp"],
+            "fsdp": self.dense_mesh["fsdp"],
+            "dp_replicate": self.dense_mesh["dp_replicate"],
+            "tp": self.dense_mesh["tp"],
         }
-        logger.info(
-            f"meshes: {self._meshes}"
-        )
 
         # Validate mesh sizes
         self._validate_meshes()
@@ -149,11 +152,8 @@ class ParallelizeDims:
         """Validate that created meshes have the expected sizes."""
         expected_sizes = {
             "pp": self.pp,
-            "batch": self.dp_replicate * self.dp_shard,
-            "loss": self.dp_replicate * self.dp_shard * self.cp,
             "dp_replicate": self.dp_replicate,
             "fsdp": self.dp_shard * self.cp,
-            "cp": self.cp,
             "tp": self.tp,
         }
 
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     world_size = int(os.getenv("WORLD_SIZE"))
 
     device_mesh = dist_setup(rank, world_size)
-    parallelize_dims = ParallelizeDims(
+    parallelize_dims = ParallelDims(
         dp_replicate=1,
         dp_shard=4,
         cp=1,

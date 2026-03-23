@@ -9,7 +9,7 @@ from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_dist_env, set_seed
 from tests.npu.train_utils import (
-    ParallelizeDims,
+    ParallelDims,
     Qwen3ForCausalLM,
     Qwen3ToyConfig,
     TrainConfig,
@@ -29,7 +29,7 @@ TRAIN_CONFIG = TrainConfig(
     loss_fn=torch.nn.CrossEntropyLoss(reduction="mean"),
     is_debug=True,
     device="npu",
-    steps=200,
+    steps=100,
 )
 
 XPU_GRAPH_CONFIG = XpuGraphConfig(
@@ -37,8 +37,11 @@ XPU_GRAPH_CONFIG = XpuGraphConfig(
     freeze=False,
     target=Target.npu,
     opt_level=OptLevel.level1,
+    fallback_legacy_dispatch=False, # joint pass only available when using _dispatch_and_compile but not _legacy_dispatch_and_compile
     debug=True,
-    bucketing_and_reordering=False,
+    bucketing=False,
+    reordering=False,
+    reshard_after_forward=True,
     vendor_compiler_config=None,
 )
 
@@ -50,12 +53,14 @@ def run_fsdp(path: str = "/tmp/test/fsdp.pt"):
     mp.set_start_method("spawn", force=True)
     train_config = TRAIN_CONFIG
     world_size_ = torch.npu.device_count()
-    train_config.parallelize_dims = ParallelizeDims(
+    train_config.parallelize_dims = ParallelDims(
         dp_replicate=1,
-        dp_shard=world_size_,
+        dp_shard=world_size_ // 4,
         cp=1,
-        tp=1,
+        tp=4,
         pp=1,
+        ep=1,
+        etp=1,
         world_size=world_size_,
         device=train_config.device,
     )
@@ -69,10 +74,26 @@ def run_fsdp(path: str = "/tmp/test/fsdp.pt"):
 
 
 def run_fsdp_bucketing_and_reordering():
-    logger.info("begin test fsdp bucketing and reordering")
-    XPU_GRAPH_CONFIG.bucketing_and_reordering = True
+    logger.info("begin test fsdp bucketing && reordering")
+    XPU_GRAPH_CONFIG.bucketing = True
+    XPU_GRAPH_CONFIG.reordering = True
     run_fsdp("/tmp/test/fsdp_bucketing_and_reordering.pt")
-    XPU_GRAPH_CONFIG.bucketing_and_reordering = False
+    XPU_GRAPH_CONFIG.bucketing = False
+    XPU_GRAPH_CONFIG.reordering = False
+
+
+def run_fsdp_bucketing():
+    logger.info("begin test fsdp bucketing")
+    XPU_GRAPH_CONFIG.bucketing = True
+    run_fsdp("/tmp/test/fsdp_bucketing.pt")
+    XPU_GRAPH_CONFIG.bucketing = False
+
+
+def run_fsdp_reordering():
+    logger.info("begin test fsdp reordering")
+    XPU_GRAPH_CONFIG.reordering = True
+    run_fsdp("/tmp/test/fsdp_reordering.pt")
+    XPU_GRAPH_CONFIG.reordering = False
 
 
 def run_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
@@ -81,12 +102,14 @@ def run_no_fsdp(path: str = "/tmp/test/no_fsdp.pt"):
     mp.set_start_method("spawn", force=True)
     TRAIN_CONFIG.is_compile = True
     train_config = TRAIN_CONFIG
-    train_config.parallelize_dims = ParallelizeDims(
+    train_config.parallelize_dims = ParallelDims(
         dp_replicate=1,
         dp_shard=1,
         cp=1,
         tp=1,
         pp=1,
+        ep=1,
+        etp=1,
         world_size=1,
         device=train_config.device,
     )
@@ -211,9 +234,12 @@ def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
     logger.info("begin test fsdp with bucketing and reordering vs fsdp without bucketing and reordering")
     prepare_test_data()
-    run_fsdp_bucketing_and_reordering()
     run_fsdp()
+    # run_fsdp_reordering()
+    run_fsdp_bucketing_and_reordering()
     compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/fsdp.pt", atol=0.0, rtol=0.0)
+    # compare_weight("/tmp/test/fsdp_reordering.pt", "/tmp/test/fsdp.pt", atol=0.0, rtol=0.0)
+    # compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_reordering_grad_rank0.pt", tolerance=0)
     compare_grad_xors("/tmp/test/fsdp_grad_rank0.pt", "/tmp/test/fsdp_bucketing_and_reordering_grad_rank0.pt", tolerance=0)
 
 

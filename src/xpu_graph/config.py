@@ -57,7 +57,14 @@ class XpuGraphConfig:
         # If folding_freezed_params is False, XpuGraph will not fold freezed parameters and allow parameter hot-swapping
         True
     )
-    bucketing_and_reordering: bool = False
+    # Whether to enable bucketing and reordering
+    # bucketing is to bucketize some communication ops to reduce the communication overhead
+    # reordering is to reorder the ops to make sure overlap the communication ops with computation ops
+    bucketing: bool = False
+    reordering: bool = False
+    # Whether to enable reshard after forward
+    # reshard_after_forward is to reshard the tensor after forward to make sure the tensor is in the correct shard
+    reshard_after_forward: bool = False
 
     # So far we only support configure "mode", because we mainly use "Inductor" as a vendor's compiler.
     # mode must be one of {"cudagraphs", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"},

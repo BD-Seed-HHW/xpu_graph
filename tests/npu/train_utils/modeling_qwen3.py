@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from xpu_graph.utils import logger, setup_logger
 
 from tests.npu.test_dist_utils import set_seed
+
+from .parallel_dims import ParallelDims
 
 
 # SimpleModelConfig from huggingface Qwen/Qwen3-0.6B/config.json
@@ -46,6 +49,107 @@ class Qwen3ToyConfig:
 
 
 # modeling_qwen3, copied and simplified from transformers
+class ColumnParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, parallel_dims: ParallelDims, bias=False):
+        super().__init__()
+        self.tp_mesh = parallel_dims.get_mesh("tp")
+        self.tp_size = self.tp_mesh.size()
+        assert out_features % self.tp_size == 0
+        self.linear = nn.Linear(in_features, out_features // self.tp_size, bias=bias)
+        self.tp_group = self.tp_mesh.get_group()
+        self.register_load_state_dict_pre_hook(self._pre_load_state_dict_hook)
+
+    def forward(self, x):
+        return self.linear(x)
+
+    def _pre_load_state_dict_hook(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        store_key = prefix + "weight"
+        new_key = prefix + "linear.weight"
+        if store_key in state_dict:
+            full_w = state_dict.pop(store_key)
+            sharded_w = full_w.chunk(self.tp_size, dim=0)
+            print(f"{torch.distributed.get_rank()}: {store_key}, {self.tp_mesh.get_local_rank()=}, {sharded_w[self.tp_mesh.get_local_rank()].shape=}")
+            state_dict[new_key] = sharded_w[self.tp_mesh.get_local_rank()]
+
+
+class RowParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, parallel_dims: ParallelDims, bias=False):
+        super().__init__()
+        self.tp_mesh = parallel_dims.get_mesh("tp")
+        self.tp_size = self.tp_mesh.size()
+        assert in_features % self.tp_size == 0
+        self.linear = nn.Linear(in_features // self.tp_size, out_features, bias=bias)
+        self.tp_group = self.tp_mesh.get_group()
+        self.register_load_state_dict_pre_hook(self._pre_load_state_dict_hook)
+
+    def forward(self, x):
+        output = self.linear(x)
+        dist.all_reduce(output, group=self.tp_group)
+        return output
+
+    def _pre_load_state_dict_hook(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        store_key = prefix + "weight"
+        new_key = prefix + "linear.weight"
+        if store_key in state_dict:
+            full_w = state_dict.pop(store_key)
+            sharded_w = full_w.chunk(self.tp_size, dim=1)
+            print(f"{torch.distributed.get_rank()}: {store_key}, {self.tp_mesh.get_local_rank()=}, {sharded_w[self.tp_mesh.get_local_rank()].shape=}")
+            state_dict[new_key] = sharded_w[self.tp_mesh.get_local_rank()]
+
+
+class ParallelEmbedding(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, parallel_dims: ParallelDims):
+        super().__init__()
+        self.tp_mesh = parallel_dims.get_mesh("tp")
+        self.tp_size = self.tp_mesh.size()
+        assert embedding_dim % self.tp_size == 0
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim // self.tp_size)
+        self.tp_group = self.tp_mesh.get_group()
+        self.register_load_state_dict_pre_hook(self._pre_load_state_dict_hook)
+
+    def forward(self, x):
+        o = self.embedding(x)
+        dist.all_gather(o, group=self.tp_group)
+        return o
+
+    def _pre_load_state_dict_hook(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        w_key = prefix + "weight"
+        lw_key = prefix + "embedding.weight"
+        if lw_key not in state_dict and w_key in state_dict:
+            full_w = state_dict.pop(w_key)
+            print(f"{torch.distributed.get_rank()}: {w_key}, {self.tp_mesh.get_local_rank()=}, {full_w.shape=}")
+            state_dict[lw_key] = full_w.chunk(self.tp_size, dim=1)[self.tp_mesh.get_local_rank()]
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -95,29 +199,61 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3ToyConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ToyConfig, layer_idx: int, **kwargs):
         super().__init__()
+        self.kwargs = kwargs
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
+        self.tp_group = None
+        parallel_dims = self.kwargs.get("parallel_dims", None)
+        if parallel_dims is not None and parallel_dims.tp > 1 and dist.is_initialized():
+            self.tp_group = parallel_dims.get_mesh("tp").get_group()
+            print(f"self.tp_group: {self.tp_group}, parallel_dims.tp: {parallel_dims.tp}")
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
+        if self.tp_group is not None:
+            self.q_proj = ColumnParallelLinear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim,
+                parallel_dims=parallel_dims,
+                bias=config.attention_bias,
+            )
+            self.k_proj = ColumnParallelLinear(
+                config.hidden_size,
+                config.num_key_value_heads * self.head_dim,
+                parallel_dims=parallel_dims,
+                bias=config.attention_bias,
+            )
+            self.v_proj = ColumnParallelLinear(
+                config.hidden_size,
+                config.num_key_value_heads * self.head_dim,
+                parallel_dims=parallel_dims,
+                bias=config.attention_bias,
+            )
+            self.o_proj = RowParallelLinear(
+                config.num_attention_heads * self.head_dim,
+                config.hidden_size,
+                parallel_dims=parallel_dims,
+                bias=config.attention_bias,
+            )
+        else:
+            self.q_proj = nn.Linear(
+                config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.k_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.o_proj = nn.Linear(
+                config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            )
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=True)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps, elementwise_affine=True)
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -157,9 +293,14 @@ class Qwen3Attention(nn.Module):
         return attn_output
 
     def init_weights(self, init_std):
+        def _weight(m: nn.Module) -> torch.Tensor:
+            if hasattr(m, "linear"):
+                return m.linear.weight
+            return m.weight
+
         for linear in (self.q_proj, self.k_proj, self.v_proj):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.o_proj.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(_weight(linear), mean=0.0, std=0.02)
+        nn.init.trunc_normal_(_weight(self.o_proj), mean=0.0, std=init_std)
         if self.q_norm is not None:
             self.q_norm.reset_parameters()
         if self.k_norm is not None:
@@ -167,15 +308,41 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    def __init__(self, config: Qwen3ToyConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ToyConfig, layer_idx: int, **kwargs):
         super().__init__()
+        self.kwargs = kwargs
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.layer_idx = layer_idx
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.tp_group = None
+        parallel_dims = self.kwargs.get("parallel_dims", None)
+        if parallel_dims is not None and parallel_dims.tp > 1 and dist.is_initialized():
+            self.tp_group = parallel_dims.get_mesh("tp").get_group()
+            print(f"self.tp_group: {self.tp_group}, parallel_dims.tp: {parallel_dims.tp}")
+        if self.tp_group is not None:
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                parallel_dims=parallel_dims,
+                bias=False,
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.intermediate_size,
+                parallel_dims=parallel_dims,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                parallel_dims=parallel_dims,
+                bias=False,
+            )
+        else:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = nn.SiLU()
         # self.act_fn = nn.ReLU()
 
@@ -184,19 +351,25 @@ class Qwen3MLP(nn.Module):
         return out
 
     def init_weights(self, init_std):
-        nn.init.trunc_normal_(self.gate_proj.weight, mean=0.0, std=0.02)
+        def _weight(m: nn.Module) -> torch.Tensor:
+            if hasattr(m, "linear"):
+                return m.linear.weight
+            return m.weight
+
+        nn.init.trunc_normal_(_weight(self.gate_proj), mean=0.0, std=0.02)
         for linear in (self.up_proj, self.down_proj):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(_weight(linear), mean=0.0, std=init_std)
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3ToyConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ToyConfig, layer_idx: int, **kwargs):
         super().__init__()
+        self.kwargs = kwargs
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx, **kwargs)
 
-        self.mlp = Qwen3MLP(config, layer_idx=layer_idx)
+        self.mlp = Qwen3MLP(config, layer_idx=layer_idx, **kwargs)
         self.weight_init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
@@ -235,8 +408,10 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Qwen3ToyConfig, device=None):
+    def __init__(self, config: Qwen3ToyConfig, **kwargs):
         super().__init__()
+        self.kwargs = kwargs
+        device = kwargs.get("device", None)
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
@@ -264,18 +439,28 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         # self.padding_idx = getattr(config, "pad_token_id", None)
         self.config = config
+        self.kwargs = kwargs
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size) # delete padding_idx
+        parallel_dims = kwargs.get("parallel_dims", None)
+        print(parallel_dims)
+        if parallel_dims is not None:
+            print(f"tp_size: {parallel_dims.get_mesh('tp').size()}, tp_group: {parallel_dims.get_mesh('tp').get_group()}")
+        # if parallel_dims is not None and parallel_dims.get_mesh("tp").size() > 1:
+        #     tp_group = parallel_dims.get_mesh("tp").get_group()
+        #     self.embed_tokens = ParallelEmbedding(config.vocab_size, config.hidden_size, parallel_dims=parallel_dims)
+        # else:
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3DecoderLayer(config, layer_idx, **kwargs) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config, **kwargs)
         self.gradient_checkpointing = False
         # self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
@@ -291,6 +476,14 @@ class Qwen3Model(nn.Module):
     ):
         if (input_ids is None):
             raise ValueError("You must specify exactly input_ids")
+        # from torch.distributed._tensor import DTensor, Replicate
+        # if not isinstance(input_ids, DTensor):
+        #     tp_plan = self.kwargs.get("parallel_dims", None).get_mesh("tp")
+        #     input_ids = DTensor.from_local(
+        #         input_ids,
+        #         device_mesh=tp_plan,
+        #         placements=[Replicate()],
+        #     )
 
         input_embeds = self.embed_tokens(input_ids)
         batch_size, seq_length = input_embeds.shape[:2]
@@ -321,9 +514,11 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(nn.Module):
 
-    def __init__(self, config: Qwen3ToyConfig):
+    def __init__(self, config, **kwargs):
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.config = config
+        self.kwargs = kwargs
+        self.model = Qwen3Model(config, **kwargs)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -337,7 +532,8 @@ class Qwen3ForCausalLM(nn.Module):
 
     def init_weights(self):
         self.model.init_weights()
-        self.lm_head.weight = self.model.embed_tokens.weight
+        final_out_std = self.config.hidden_size**-0.5
+        self.lm_head.weight = nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_out_std, a=-final_out_std, b=final_out_std)
 
 
 if __name__ == "__main__":
