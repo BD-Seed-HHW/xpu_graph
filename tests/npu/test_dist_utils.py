@@ -53,6 +53,7 @@ def set_dist_env():
             port = s.getsockname()[1]
 
         os.environ["MASTER_PORT"] = str(port)
+        os.environ["HCCL_DETERMINISTIC"] = "true"
 
     print(f'Setting master: {os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}')
 

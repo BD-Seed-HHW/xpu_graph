@@ -55,7 +55,6 @@ def rmsnorm_test(xpu_graph, func, input_dtype, weight_dtype, dynamic):
         weight = None
 
     compiled = torch.compile(func, backend=xpu_graph, dynamic=dynamic)
-    weight = torch.randn((1024), device=device, dtype=data_type)
     norm = compiled(inputs, weight)
     norm1 = func(inputs, weight)
     assert is_similar(norm1, norm)

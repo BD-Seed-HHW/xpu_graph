@@ -36,6 +36,7 @@ class XpuGraph:
         self,
         config: XpuGraphConfig,
         cache: XpuGraphCache = None,
+        **kwargs,
     ):
         config._reset_config_with_env()
         self._config = config
@@ -45,7 +46,7 @@ class XpuGraph:
         self._cache = cache if cache and config.enable_cache else default_cache() if config.enable_cache else None
         self._set_context()
         # WARNING(liuyuan): _pass_manager MUST be initilized after _set_context because triton kernel depends on environment varaibels that fetched in _set_context.
-        self._pass_manager = PassManager(self._config)
+        self._pass_manager = PassManager(self._config, **kwargs)
         # NOTE(liuyuan): The plugin patterns should be placed before those built-in.
         self._pass_manager.get_pattern_manager().insert_patterns(
             chain.from_iterable(__PLUGIN_PATTERN_GROUP__.get(self._config.target, {}).values())
@@ -115,6 +116,7 @@ class XpuGraph:
                 if isinstance(xpu_compiled, SerializableArtifact):
                     # WARNING(liuyuan): MUST get the real artifact itself before return.
                     xpu_compiled = xpu_compiled.artifact
+
             return xpu_compiled
 
         def wrapped(gm, sample_inputs):
@@ -210,7 +212,7 @@ class XpuGraph:
             partition_fn = get_partition_fn(self._config.partition_fn) or default_partition
 
             return partition_fn(new_joint_gm, joint_args, num_fwd_outputs=num_fwd_outputs)
-
+        print(f"partition_fn: {partition_fn.__name__}")
         aot_config["partition_fn"] = partition_fn
         if self._config.freeze:
             aot_config["inference_compiler"] = functools.partial(

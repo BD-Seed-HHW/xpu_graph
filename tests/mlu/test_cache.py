@@ -13,6 +13,12 @@ device = "mlu"
 dtype = torch.float32
 
 
+@parametrize_class_env(
+    [
+        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    ],
+)
 def test_xpugraph_cache(caplog, tmp_path):
     # Note: currently, we do not guard on **freezed params**
     #       thus serialize a freeze artifact but with different parameters would result in wrong result

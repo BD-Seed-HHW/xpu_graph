@@ -30,6 +30,12 @@ class TestTraining:
         compare_training(device, data_type, ReproCls, self.train_backend)
 
 
+@parametrize_class_env(
+    [
+        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    ],
+)
 class TestTrainingWithPartiioner:
     @pytest.mark.parametrize(
         "partition_fn",

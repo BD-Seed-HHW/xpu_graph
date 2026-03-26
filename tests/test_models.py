@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-
 from xpu_graph.test_utils import is_similar
 
 

@@ -48,6 +48,12 @@ def test_op_monitor_fail(caplog):
     assert f"Monitored op: {aten.add.Tensor}" in caplog.text and "diverges" in caplog.text
 
 
+@parametrize_class_env(
+    [
+        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "1"},
+        {"XPUGRAPH_FALLBACK_LEGACY_DISPATCH": "0"},
+    ],
+)
 class FaultyPattern(Pattern):
     def process(self, gm: torch.fx.GraphModule) -> bool:
         changed = False

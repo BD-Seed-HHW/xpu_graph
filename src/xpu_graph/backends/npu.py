@@ -7,7 +7,6 @@ from torch.fx.graph_module import GraphModule
 
 from xpu_graph.backends import device_graph
 from xpu_graph.cache import SerializableArtifact, temp_disable_tracing_envs
-from xpu_graph.fx_utils import decompose_for_inductor
 from xpu_graph.utils import logger, recursive_set_obj
 
 
@@ -38,8 +37,6 @@ def has_triton_kernel(gm: GraphModule):
 
 
 def ge_compiler(module: torch.nn.Module, example_inputs, **config_dict: Dict) -> torch.nn.Module:
-    import torch.fx as fx
-    import torch_npu
 
     torch.npu.set_compile_mode(jit_compile=False)
 
@@ -82,6 +79,8 @@ def ge_compiler(module: torch.nn.Module, example_inputs, **config_dict: Dict) ->
 
     if not has_triton_kernel(module):
         compiled_module = NpuSerializableArtifact(compiled_module)
+    else:
+        logger.info("Triton kernel found in gm, skip serializing npu artifact.")
 
     return compiled_module
 
@@ -104,7 +103,7 @@ def inductor_compiler(
     )
 
     from torch import _TorchCompileInductorWrapper
-    from torch._inductor.compile_fx import compile_fx, compile_fx_inner
+    from torch._inductor.compile_fx import compile_fx_inner
 
     # default means None. In torch, _TorchCompileInductorWrapper's apply_mode just passes.
     mode = config_dict.get("mode", "default")

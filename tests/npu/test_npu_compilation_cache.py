@@ -36,6 +36,8 @@ class TestNpuCompilationCache:
     def test_cache(self, tmp_path, compiler_setting):
         cache = XpuGraphLocalCache(tmp_path)
         compiler_setting(self)
+        if not self.compiler._compiler._config.fallback_legacy_dispatch:
+            pytest.skip("This test requires legacy_dispatch which returns fresh artifact")
         ori_gm = []
         compiled_gm = []
 
@@ -95,22 +97,26 @@ class TestNpuCompilationCache:
         with need_xpu_graph_logs():
             model = Model(1, 4).eval().npu()
             compiled = self.compiler.compile(model, dynamic=False)
-            compiled(*self.inputs)
+            with torch.no_grad():
+                compiled(*self.inputs)
 
             torch._dynamo.reset()
             compiled = self.compiler.compile(model, dynamic=False)
 
-            assert torch.allclose(compiled(*self.inputs), model(*self.inputs), equal_nan=True)
+            with torch.no_grad():
+                assert torch.allclose(compiled(*self.inputs), model(*self.inputs), equal_nan=True)
             assert "Use cache in location" in caplog.text
 
             # torch._dynamo.reset()
             model = Model(2, 6).eval().npu()
             compiled = self.compiler.compile(model, dynamic=False)
-            assert torch.allclose(compiled(*self.inputs), model(*self.inputs), equal_nan=True)
+            with torch.no_grad():
+                assert torch.allclose(compiled(*self.inputs), model(*self.inputs), equal_nan=True)
 
             # torch._dynamo.reset()
             model = Model(torch.ones(1, dtype=torch.int32).npu(), torch.ones(1, dtype=torch.int32).npu()).eval().npu()
             compiled = self.compiler.compile(model, dynamic=False)
-            assert torch.allclose(compiled(*self.inputs), model(*self.inputs), equal_nan=True)
+            with torch.no_grad():
+                assert torch.allclose(compiled(*self.inputs), model(*self.inputs), equal_nan=True)
 
             # FIXME(liuyuan): However, the results of constant folding passes, which are not applied to cpu variables,  will not save by npu backend, fix it.
