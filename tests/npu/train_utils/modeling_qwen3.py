@@ -78,7 +78,6 @@ class ColumnParallelLinear(nn.Module):
         if store_key in state_dict:
             full_w = state_dict.pop(store_key)
             sharded_w = full_w.chunk(self.tp_size, dim=0)
-            print(f"{torch.distributed.get_rank()}: {store_key}, {self.tp_mesh.get_local_rank()=}, {sharded_w[self.tp_mesh.get_local_rank()].shape=}")
             state_dict[new_key] = sharded_w[self.tp_mesh.get_local_rank()]
 
 
@@ -113,7 +112,6 @@ class RowParallelLinear(nn.Module):
         if store_key in state_dict:
             full_w = state_dict.pop(store_key)
             sharded_w = full_w.chunk(self.tp_size, dim=1)
-            print(f"{torch.distributed.get_rank()}: {store_key}, {self.tp_mesh.get_local_rank()=}, {sharded_w[self.tp_mesh.get_local_rank()].shape=}")
             state_dict[new_key] = sharded_w[self.tp_mesh.get_local_rank()]
 
 
@@ -209,7 +207,6 @@ class Qwen3Attention(nn.Module):
         parallel_dims = self.kwargs.get("parallel_dims", None)
         if parallel_dims is not None and parallel_dims.tp > 1 and dist.is_initialized():
             self.tp_group = parallel_dims.get_mesh("tp").get_group()
-            print(f"self.tp_group: {self.tp_group}, parallel_dims.tp: {parallel_dims.tp}")
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -319,7 +316,6 @@ class Qwen3MLP(nn.Module):
         parallel_dims = self.kwargs.get("parallel_dims", None)
         if parallel_dims is not None and parallel_dims.tp > 1 and dist.is_initialized():
             self.tp_group = parallel_dims.get_mesh("tp").get_group()
-            print(f"self.tp_group: {self.tp_group}, parallel_dims.tp: {parallel_dims.tp}")
         if self.tp_group is not None:
             self.gate_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -446,14 +442,6 @@ class Qwen3Model(nn.Module):
         self.kwargs = kwargs
         self.vocab_size = config.vocab_size
 
-        parallel_dims = kwargs.get("parallel_dims", None)
-        print(parallel_dims)
-        if parallel_dims is not None:
-            print(f"tp_size: {parallel_dims.get_mesh('tp').size()}, tp_group: {parallel_dims.get_mesh('tp').get_group()}")
-        # if parallel_dims is not None and parallel_dims.get_mesh("tp").size() > 1:
-        #     tp_group = parallel_dims.get_mesh("tp").get_group()
-        #     self.embed_tokens = ParallelEmbedding(config.vocab_size, config.hidden_size, parallel_dims=parallel_dims)
-        # else:
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList(

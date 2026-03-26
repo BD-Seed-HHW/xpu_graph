@@ -212,7 +212,7 @@ class XpuGraph:
             partition_fn = get_partition_fn(self._config.partition_fn) or default_partition
 
             return partition_fn(new_joint_gm, joint_args, num_fwd_outputs=num_fwd_outputs)
-
+        print(f"partition_fn: {partition_fn.__name__}")
         aot_config["partition_fn"] = partition_fn
         if self._config.freeze:
             aot_config["inference_compiler"] = functools.partial(

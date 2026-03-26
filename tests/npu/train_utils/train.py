@@ -98,10 +98,10 @@ def get_dataloader(batch_size, num_samples, shuffle=False, path: str = None, dp_
 ## only support model written in transformer-like style, just like Qwen3ForCausalLM->Qwen3Model->Qwen3DecoderLayer...
 def get_transformer_block_buckets(model: Qwen3ForCausalLM) -> list[list[str] | str]:
     module_list = []
-    # module_list.append(model.model.embed_tokens)
+    module_list.append(model.model.embed_tokens)
     for transformer_block in model.model.layers:
         module_list.append(transformer_block)
-    # module_list.append([model.model.norm, model.lm_head])
+    module_list.append([model.model.norm, model.lm_head])
 
     def convert_modules_to_fqns(modules, module_to_fqn_mapping):
         """Convert a (possibly nested) list of modules to FQN strings."""

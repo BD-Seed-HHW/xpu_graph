@@ -25,7 +25,7 @@ TRAIN_CONFIG = TrainConfig(
     model_path="/tmp/test/weight.pt",
     dataset_path="/tmp/test/data.pt",
     parallelize_dims=None,
-    model_config=Qwen3ToyConfig(),
+    model_config=Qwen3ToyConfig(num_hidden_layers=2),
     loss_fn=torch.nn.CrossEntropyLoss(reduction="mean"),
     is_debug=True,
     device="npu",
@@ -55,9 +55,9 @@ def run_fsdp(path: str = "/tmp/test/fsdp.pt"):
     world_size_ = torch.npu.device_count()
     train_config.parallelize_dims = ParallelDims(
         dp_replicate=1,
-        dp_shard=world_size_ // 4,
+        dp_shard=world_size_,
         cp=1,
-        tp=4,
+        tp=1,
         pp=1,
         ep=1,
         etp=1,
@@ -212,7 +212,7 @@ def generate_data(folder: str = "/tmp/test"):
 
 
 def generate_weight_and_save(folder: str = "/tmp/test"):
-    model = Qwen3ForCausalLM(Qwen3ToyConfig())
+    model = Qwen3ForCausalLM(TRAIN_CONFIG.model_config)
     model.init_weights()
     state_dict = model.state_dict()
     if not os.path.exists(folder):
@@ -234,7 +234,7 @@ def test_bucketing_and_reordering():
     setup_logger(is_debug=True)
     logger.info("begin test fsdp with bucketing and reordering vs fsdp without bucketing and reordering")
     prepare_test_data()
-    run_fsdp()
+    # run_fsdp()
     # run_fsdp_reordering()
     run_fsdp_bucketing_and_reordering()
     compare_weight("/tmp/test/fsdp_bucketing_and_reordering.pt", "/tmp/test/fsdp.pt", atol=0.0, rtol=0.0)

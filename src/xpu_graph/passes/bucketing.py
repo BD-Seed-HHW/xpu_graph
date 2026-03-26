@@ -55,12 +55,6 @@ def _schedulable_wait_node(node: torch.fx.Node) -> bool:
 
 
 class ManualBucketer:
-    """
-    Buckets collective operations based on user specifications.
-    The actual bucket happens in bucket_collectives, where all-gathers/reduce-scatters in
-        `nodes` will be buckted one single all-gather/reduce-scatter.
-    """
-
     def __init__(
         self,
         graph: fx.Graph,
@@ -79,7 +73,6 @@ class ManualBucketer:
         self.wait_to_node_map: dict[fx.Node, fx.Node] = defaultdict()
 
     def _collect_node_ancestors(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
-        """Collect all ancestors for each node."""
         ancestors: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
         for node in self.graph.nodes:
             for input_node in node.all_input_nodes:
@@ -89,7 +82,6 @@ class ManualBucketer:
         return ancestors
 
     def _collect_node_users(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
-        """Collect all users for each node."""
         node_users: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
         for node in self.graph.nodes:
             for output_node in list(node.users.keys()):
@@ -103,9 +95,6 @@ class ManualBucketer:
         target_op: str,
         dep_dict: dict[torch.fx.Node, OrderedSet[torch.fx.Node]],
     ) -> bool:
-        """
-        Check if the node is directly used for fetch parameters/gradients
-        """
         deps: OrderedSet[fx.Node] = dep_dict[node]
         seen_target_op = 0
         for d in deps:
@@ -126,14 +115,14 @@ class ManualBucketer:
         while next_node in coll_nodes:
             next_node = next_node.next
         if is_all_gather(first):
-            new_nodes, replacements = merge_all_gather_bucket(
+            merge_all_gather_bucket(
                 self.graph,
                 coll_nodes,
                 wait_insertion_point=first_wait,
                 insert_before=next_node,
             )
         elif is_reduce_scatter(first):
-            new_nodes, replacements = merge_reduce_scatter_bucket(
+            merge_reduce_scatter_bucket(
                 self.graph,
                 coll_nodes,
                 wait_insertion_point=first_wait,
@@ -145,9 +134,6 @@ class ManualBucketer:
             )
 
     def manual_bucket_collectives(self, nodes: list[fx.Node]) -> None:
-        """
-        Bucket all all-gather/reduce-scatter nodes from nodes into one all-gather/reduce-scatter.
-        """
         # Filter out valid collectives
         collectives = [n for n in nodes if n in self.collective_info]
         if collectives == []:
@@ -157,9 +143,6 @@ class ManualBucketer:
             key = bucket_key(node, self.bucket_mode)
             if not (is_all_gather(node) or is_reduce_scatter(node)):
                 continue
-            # We only want to bucket all-gather/reduce-scatter that
-            # 1. all_gather that have ancestors dependent only on input placeholder(parameters)
-            # 2. reduce scatter that the wait user node is returned as output(gradients)
             if is_all_gather(node) and not self._check_recursive_dep(
                 node, "placeholder", self.node_ancestors
             ):
@@ -170,7 +153,7 @@ class ManualBucketer:
                 continue
             if key is not None:
                 grouped_collectives[key].add(node)
-        for key, nodes in grouped_collectives.items():  # type: ignore[arg-type]
+        for key, nodes in grouped_collectives.items():
             self._bucket_group(list(nodes))
 
 
@@ -187,8 +170,6 @@ class Bucketing(Optimizer):
 
     def process(self, gm: fx.GraphModule):
         gm.graph.lint()
-        if torch.distributed.get_rank() == 0:
-            print(f"before bucket collectives, graph :\n{gm.print_readable()}")
         for node in gm.graph.nodes:
             if node.op == "call_function" and (node.target == torch.ops.bucketing._pre_bucket_all_gather or node.target == torch.ops.bucketing._pre_bucket_reduce_scatter):
                 return False
@@ -205,12 +186,9 @@ class Bucketing(Optimizer):
         )
 
         self._manual_bucket_collectives()
-        if torch.distributed.get_rank() == 0:
-            print(f"after bucket collectives, graph :\n{gm.print_readable()}")
         return True
 
     def _identify_collectives(self) -> None:
-        """Identify all collective operations."""
         for node in self.graph.nodes:
             if _schedulable_wait_node(node):
                 start = node.args[0]
@@ -222,7 +200,7 @@ class Bucketing(Optimizer):
 
     def _manual_bucket_collectives(self) -> None:
         self._get_nodes_in_plans()
-        for i, nodes in enumerate(self.nodes_in_plans):
+        for nodes in self.nodes_in_plans:
             self.bucketer.manual_bucket_collectives(nodes=nodes)
         _stable_topological_sort(self.graph, {})
         self.graph.lint()

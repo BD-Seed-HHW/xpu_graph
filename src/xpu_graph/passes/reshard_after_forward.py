@@ -57,7 +57,7 @@ class ReshardAfterForward(Optimizer):
                         and user.target == torch.ops.aten.slice.Tensor
                     ):
                         force_recompute_node(user)
-
+                        print(f"force recompute user: {user.name}")
                 # Force-recompute potential dtype casts from all_gather
                 if (
                     ag_node.all_input_nodes[0].op == "call_function"
