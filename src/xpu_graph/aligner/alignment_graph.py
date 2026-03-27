@@ -10,6 +10,9 @@ class Stage(IntEnum):
     BACKWARD = 1
 
 
+BACKWARD_NID_OFFSET = 100000
+
+
 @dataclass(frozen=True)
 class OpInfo:
     op: str

@@ -9,7 +9,7 @@ from torch._functorch.aot_autograd import aot_module_simplified
 from torch.overrides import TorchFunctionMode
 import torch.utils._pytree as pytree
 
-from .alignment_graph import AlignmentGraph, GraphMapping, OpInfo, Stage
+from .alignment_graph import BACKWARD_NID_OFFSET, AlignmentGraph, GraphMapping, OpInfo, Stage
 from .visualize import AlignmentVisualizer
 import logging
 logger = logging.getLogger("xpu_graph")
@@ -204,7 +204,7 @@ class AlignmentManager:
             if fxnode.op == "call_function" and fxnode.target == torch.ops.xpugraph.marker.default:
                 source_node: torch.fx.Node = fxnode.args[0]
                 fw_nid: int = fxnode.args[1]
-                nid = fw_nid + bw_nid_offs  # bw align nid typically is offset from fw nid by total number of fw markers.
+                nid = fw_nid + bw_nid_offs
                 if agraph.is_fw_node_collapsed(variant_id, fw_nid):
                     source_node.meta.setdefault("collapsed_align_node_ids", []).append(nid)
                     fxnode.replace_all_uses_with(source_node)
@@ -330,7 +330,7 @@ class AlignedModelGenerator:
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
-            if (not self._disabled and not self._ctx._is_noop(func, args, kwargs)):
+            if (not self._disabled):
                 result = self._inject_markers(result)
             return result
 
@@ -354,8 +354,7 @@ class AlignedModelGenerator:
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
-            if (not self._ctx._is_noop(func, args, kwargs)):
-                self._instrument(result, func)
+            self._instrument(result, func)
             return result
 
         def reset_id_counter(self):
@@ -378,7 +377,9 @@ class AlignedModelGenerator:
             if result.requires_grad:
                 result_grad_fn = result.grad_fn
                 def _bw_hook(grad, nid=node_id, mode=self):
-                    bw_nid = nid + mode._next_node_id  # bw nid typically offset from fw nid by total number of fw markers (e.g., _next_node_id).
+                    if not isinstance(grad, torch.Tensor):
+                        return
+                    bw_nid = nid + BACKWARD_NID_OFFSET
                     mode._ctx._agraph.add_grad_link(nid, bw_nid)
                     target = type(result_grad_fn).__name__ if result_grad_fn is not None else "UnknownBackward"
                     bw_opinfo = OpInfo(op="autograd", target=target, name=target)
@@ -430,11 +431,9 @@ class AlignedModelGenerator:
         self._agraph.register_variant(variant_id)
 
     def _make_backend(self):
-        fw_marker_count = [0]   # shared between fw/bw compilers
         variant_id = self._variant_id
 
         def alignment_fw_compiler(gm: torch.fx.GraphModule, example_inputs):
-            fw_marker_count[0] = sum(1 for n in gm.graph.nodes if n.target == torch.ops.xpugraph.marker.default)
             gm = self._mgr.build_canonical_module_stack_pass(self._agraph_id, Stage.FORWARD, gm)
             gm = self._mgr.inject_marker_meta_and_remove_marker_fw_pass(self._agraph_id, variant_id, gm)
             self._mgr.build_topology_from_fxgraph(self._agraph_id, variant_id, gm.graph)
@@ -445,7 +444,7 @@ class AlignedModelGenerator:
             return functorch.compile.make_boxed_func(gm.forward)
 
         def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
-            bw_offset = fw_marker_count[0]
+            bw_offset = BACKWARD_NID_OFFSET
             gm = self._mgr.build_canonical_module_stack_pass(self._agraph_id, Stage.BACKWARD, gm, bw_nid_offs=bw_offset)
             gm = self._mgr.inject_marker_meta_and_remove_marker_bw_pass(self._agraph_id, variant_id, bw_offset, gm)
             self._mgr.build_topology_from_fxgraph(self._agraph_id, variant_id, gm.graph)
@@ -477,7 +476,7 @@ class AlignedModelGenerator:
 
         return backend
 
-    def get_compiled(self, model: nn.Module, args: tuple, kwargs: dict) -> nn.Module:
+    def get_compiled(self, model: nn.Module, *args: tuple, **kwargs: dict) -> nn.Module:
         """Return a compiled, instrumented model."""
         if self._generated:
             raise RuntimeError("An AlignedModelGenerator instance can only generate once. Create a new one for another generation.")
