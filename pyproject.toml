@@ -23,7 +23,6 @@ description = "A graph compiler based on Torch Dynamo."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-  "torch>=2.7.0a0,<2.8.0",
   "dataclasses",
   "numpy",
   "pyyaml",

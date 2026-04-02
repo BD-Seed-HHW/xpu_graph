@@ -1,6 +1,36 @@
 import dataclasses
+import warnings
 from os import PathLike
 from typing import Any, Dict
+
+
+def _check_torch():
+    REQUIRED_MIN = "2.7.0a0"
+    REQUIRED_MAX = "2.8.0"
+
+    try:
+        import torch
+    except ImportError:
+        raise ImportError(
+            f"xpu_graph requires PyTorch (>={REQUIRED_MIN},<{REQUIRED_MAX}) "
+            "but torch is not installed in the current environment. "
+            "Please install a compatible version manually: "
+            "https://pytorch.org/get-started/locally/"
+        )
+
+    from packaging.version import Version
+
+    ver = Version(torch.__version__.split("+")[0])
+    if not (Version(REQUIRED_MIN) <= ver < Version(REQUIRED_MAX)):
+        warnings.warn(
+            f"xpu_graph is designed for torch>={REQUIRED_MIN},<{REQUIRED_MAX}, "
+            f"but the current environment has torch=={torch.__version__}. "
+            "Some features may not work correctly.",
+            stacklevel=2,
+        )
+
+
+_check_torch()
 
 from .cache import XpuGraphCache, XpuGraphLocalCache, default_cache, no_cache
 from .compiler import XpuGraph
